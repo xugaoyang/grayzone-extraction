@@ -12,12 +12,13 @@ const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
 const screens = ['lobby', 'hud', 'inventory', 'pause', 'result', 'help', 'settings', 'map-overlay'];
 const audio = new GameAudio();
 let profile = loadProfile(), selectedKit = 'basic', state = 'lobby', overlayReturn = 'lobby';
-let settings = { sensitivity: 1, volume: .5, quality: 'high' };
+let settings = { sensitivity: 1, volume: .5, musicVolume: .4, quality: 'high' };
 try {
   const stored = JSON.parse(localStorage.getItem('grayzone.settings') || '{}');
-  settings = { sensitivity: clamp(Number(stored.sensitivity) || 1, .3, 2), volume: Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : .5, quality: ['low','medium','high'].includes(stored.quality) ? stored.quality : 'high' };
+  settings = { sensitivity: clamp(Number(stored.sensitivity) || 1, .3, 2), volume: Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : .5, musicVolume: Number.isFinite(stored.musicVolume) ? clamp(stored.musicVolume, 0, 1) : .4, quality: ['low','medium','high'].includes(stored.quality) ? stored.quality : 'high' };
 } catch { /* Keep safe defaults. */ }
 audio.volume = settings.volume;
+audio.musicVolume = settings.musicVolume;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(76, innerWidth / innerHeight, .075, 280);
@@ -45,16 +46,22 @@ camera.add(weapon);
 weapon.position.set(.24, -.29, -.7);
 weapon.visible = false;
 const muzzle = new THREE.PointLight(0xffba5f, 0, 5);
-muzzle.position.set(.28, -.16, -1.1);
-camera.add(muzzle);
+muzzle.position.copy(weapon.userData.muzzle);
+weapon.add(muzzle);
+const muzzleFlash = new THREE.Mesh(new THREE.SphereGeometry(.036, 6, 4), new THREE.MeshBasicMaterial({ color: 0xffdc8a, transparent: true, opacity: .85, blending: THREE.AdditiveBlending, depthWrite: false }));
+muzzleFlash.position.copy(weapon.userData.muzzle); muzzleFlash.visible = false;
+weapon.add(muzzleFlash);
 const ray = new THREE.Raycaster();
 const up = new THREE.Vector3(0,1,0);
 const keys = new Set();
 let mouseDown = false, aiming = false, yaw = 0, pitch = 0, recoil = 0;
+const weaponSway = new THREE.Vector2();
 let player = null, enemies = [], crates = [], effects = [], raidTime = 480, elapsed = 0;
 let action = null, nearest = null, nextShot = 0, footstep = 0, hitTime = 0, hurtTime = 0, hintAt = 0;
 let raidNumber = 0, lastFrame = performance.now(), uiTime = 0, lobbyTime = 0, finishReason = '';
 let saveWarningShown = false;
+const mapBackgrounds = new Map();
+let mapRoute = null;
 
 function persist() {
   if (!saveProfile(profile) && !saveWarningShown) {
@@ -66,7 +73,10 @@ function setScreen(next) {
   state = next;
   for (const id of screens) $(id).hidden = id !== next && !(id === 'hud' && ['inventory','pause','map-overlay'].includes(next));
   document.body.dataset.state = next;
+  const fieldOverlay = ['inventory','pause','map-overlay'].includes(next) || (['help','settings'].includes(next) && player && overlayReturn !== 'lobby');
+  audio.setMood(next === 'hud' ? 'raid' : next === 'result' ? 'result' : fieldOverlay ? 'pause' : 'lobby');
   mouseDown = false; aiming = false; keys.clear();
+  if (next !== 'hud') { muzzle.intensity = 0; muzzleFlash.visible = false; }
   if (next !== 'hud' && document.pointerLockElement) document.exitPointerLock();
 }
 function toast(message, type = '') {
@@ -127,9 +137,10 @@ function clearRaid() {
   enemies = []; crates = []; effects = [];
 }
 function disposeGroup(group) {
-  const geometries = new Set(), materials = new Set();
+  const geometries = new Set(), materials = new Set(), textures = new Set();
   group.traverse(o => { if (o.geometry) geometries.add(o.geometry); if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => materials.add(m)); });
-  geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose());
+  materials.forEach(m => { for (const value of Object.values(m)) if (value?.isTexture) textures.add(value); });
+  geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); textures.forEach(t => t.dispose());
 }
 function deploy() {
   let kit;
@@ -148,6 +159,7 @@ function deploy() {
   }
   elapsed = 0; raidTime = 480; action = null; nearest = null; nextShot = 0; hintAt = 0;
   hurtTime = 0; hitTime = 0; recoil = 0; yaw = 0; pitch = 0;
+  weaponSway.set(0,0); mapRoute = null;
   camera.position.set(player.x,1.68,player.z); camera.rotation.set(0,0,0);
   weapon.visible = true; setScreen('hud'); updateHUD(); audio.unlock(); lockPointer();
   toast('行动开始：先搜索前方物资箱。长按 E 搜索，M 查看撤离路线。');
@@ -232,7 +244,8 @@ function shoot() {
   if (state !== 'hud' || action || nextShot > 0 || player.sprinting) return;
   nextShot = player.kit.id === 'heavy' ? .19 : .14;
   if (player.ammo <= 0) { audio.play('empty'); startReload(); return; }
-  player.ammo--; audio.play('shot'); recoil = Math.min(.1,recoil + (aiming ? .022 : .04)); muzzle.intensity = 3;
+  player.ammo--; audio.play('shot'); recoil = Math.min(.1,recoil + (aiming ? .022 : .04)); muzzle.intensity = 3; muzzleFlash.visible = true;
+  muzzleFlash.scale.set(.7+Math.random()*.5,.7+Math.random()*.5,2.2+Math.random());
   camera.updateMatrixWorld(true); scene.updateMatrixWorld(true);
   const direction = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
   const spread = aiming ? .003 : player.moving ? .021 : .011;
@@ -334,8 +347,14 @@ function updatePlayer(dt) {
   camera.rotation.set(pitch+recoil,yaw,0);
   const fov = aiming ? 49 : player.sprinting ? 83 : 76;
   camera.fov = THREE.MathUtils.damp(camera.fov,fov,12,dt); camera.updateProjectionMatrix();
-  weapon.position.set(THREE.MathUtils.damp(weapon.position.x,aiming ? 0 : .24,14,dt),THREE.MathUtils.damp(weapon.position.y,aiming ? -.192 : -.29,14,dt) - Math.abs(bob)*.18, THREE.MathUtils.damp(weapon.position.z,aiming ? -.65 : -.7,14,dt) + recoil*.2);
-  weapon.rotation.set(action?.kind==='reload' ? -.35-Math.sin(action.elapsed*4)*.2 : player.sprinting ? -.28 : 0,0,action?.kind==='heal' ? -.7 : player.sprinting ? -.2 : 0);
+  weaponSway.multiplyScalar(Math.exp(-dt*10));
+  const reloadPose = action?.kind === 'reload' ? Math.sin(Math.PI*clamp(action.elapsed/action.duration,0,1)) : 0;
+  const breath = Math.sin(elapsed*1.8)*.0025;
+  const drift = aiming ? .08 : 1;
+  const carry = player.sprinting ? .12 : 0;
+  weapon.position.set(THREE.MathUtils.damp(weapon.position.x,(aiming ? 0 : .24)+weaponSway.x*drift,14,dt),THREE.MathUtils.damp(weapon.position.y,(aiming ? -.192 : -.29)+breath*drift-carry-reloadPose*.11,14,dt) - Math.abs(bob)*.18*drift, THREE.MathUtils.damp(weapon.position.z,(aiming ? -.65 : -.7)+reloadPose*.12,14,dt) + recoil*.2);
+  weapon.rotation.set(THREE.MathUtils.damp(weapon.rotation.x,-reloadPose*.48-(player.sprinting ? .28 : 0)+weaponSway.y*drift,14,dt),THREE.MathUtils.damp(weapon.rotation.y,weaponSway.x*drift*.5,14,dt),THREE.MathUtils.damp(weapon.rotation.z,action?.kind==='heal' ? -.7 : reloadPose*.45-(player.sprinting ? .2 : 0),14,dt));
+  if(weapon.userData.parts?.magazine){const mag=weapon.userData.parts.magazine;mag.position.y=-reloadPose*.23;mag.rotation.x=reloadPose*.18;}
   footstep -= dt;
   if (player.moving && footstep <= 0) { footstep = player.sprinting ? .28 : .44; audio.play('step'); }
   nextShot = Math.max(0,nextShot-dt);
@@ -344,26 +363,59 @@ function updatePlayer(dt) {
 
 function drawMap(canvas, large = false) {
   const ctx=canvas.getContext('2d'), width=canvas.width, height=canvas.height;
-  ctx.clearRect(0,0,width,height);
-  ctx.fillStyle='#101d20'; ctx.fillRect(0,0,width,height);
   const padding=large?38:12, scale=(width-padding*2)/100;
   const px=x=>padding+(x+50)*scale, pz=z=>padding+(z+50)*scale;
-  ctx.strokeStyle='#203034'; ctx.lineWidth=1;
-  for(let a=-50;a<=50;a+=10){ctx.beginPath();ctx.moveTo(px(a),pz(-50));ctx.lineTo(px(a),pz(50));ctx.stroke();ctx.beginPath();ctx.moveTo(px(-50),pz(a));ctx.lineTo(px(50),pz(a));ctx.stroke();}
-  ctx.fillStyle='#415052';
-  for(const s of world.solids){if(s.maxX-s.minX>95||s.maxZ-s.minZ>95)continue;ctx.fillRect(px(s.minX),pz(s.minZ),(s.maxX-s.minX)*scale,(s.maxZ-s.minZ)*scale);}
-  ctx.fillStyle='#88e5b6';ctx.strokeStyle='#88e5b6';ctx.lineWidth=1.5;
-  ctx.beginPath();ctx.arc(px(world.extract.x),pz(world.extract.z),world.extract.radius*scale,0,Math.PI*2);ctx.stroke();
+  const cacheKey=`${width}:${height}:${large}`;
+  if(!mapBackgrounds.has(cacheKey)) {
+    const background=document.createElement('canvas'); background.width=width; background.height=height;
+    const b=background.getContext('2d'), sea=b.createLinearGradient(0,0,width,height);
+    sea.addColorStop(0,'#10272d');sea.addColorStop(1,'#193c42');b.fillStyle=sea;b.fillRect(0,0,width,height);
+    b.strokeStyle='#41616b33';b.lineWidth=1;
+    for(let row=8;row<height;row+=12){b.beginPath();b.moveTo(0,row);b.lineTo(width,row-14);b.stroke();}
+    b.shadowColor='#0009';b.shadowBlur=large?14:5;
+    b.fillStyle='#2a3b3b';b.fillRect(px(-49),pz(-49),98*scale,98*scale);b.shadowBlur=0;
+    b.strokeStyle='#758b7960';b.strokeRect(px(-49),pz(-49),98*scale,98*scale);
+    const roads=[[0,23,11,53],[14,-17,9,56],[-4,-36,91,8],[-1,9,91,8],[-1,35,91,7]];
+    b.fillStyle='#415152';
+    for(const [x,z,w,d] of roads)b.fillRect(px(x-w/2),pz(z-d/2),w*scale,d*scale);
+    b.strokeStyle='#bac3a455';b.lineWidth=large?1.2:.7;b.setLineDash([3*scale,2*scale]);
+    for(const [x,z,w,d] of roads){b.beginPath();b.moveTo(px(w>d?x-w/2:x),pz(w>d?z:z-d/2));b.lineTo(px(w>d?x+w/2:x),pz(w>d?z:z+d/2));b.stroke();}b.setLineDash([]);
+    b.strokeStyle='#c3d6c210';b.lineWidth=1;
+    for(let a=-50;a<=50;a+=10){b.beginPath();b.moveTo(px(a),pz(-49));b.lineTo(px(a),pz(49));b.stroke();b.beginPath();b.moveTo(px(-49),pz(a));b.lineTo(px(49),pz(a));b.stroke();}
+    for(const s of world.solids){
+      const w=s.maxX-s.minX,d=s.maxZ-s.minZ;if(w>95||d>95)continue;
+      b.fillStyle=w*d>50?'#71847d':'#596e68';b.strokeStyle='#a1b5a866';b.lineWidth=large?1:.6;
+      b.fillRect(px(s.minX),pz(s.minZ),w*scale,d*scale);b.strokeRect(px(s.minX),pz(s.minZ),w*scale,d*scale);
+      if(large&&w*d>50){b.strokeStyle='#152a2a30';for(let x=s.minX+2;x<s.maxX;x+=3){b.beginPath();b.moveTo(px(x),pz(s.minZ));b.lineTo(px(x),pz(s.maxZ));b.stroke();}}
+    }
+    b.fillStyle='#afc1ac';b.font=`${large?12:9}px sans-serif`;b.textAlign='center';b.fillText('N ↑',width/2,large?22:10);
+    if(large){
+      for(const zone of world.zones){if(distance(zone,world.extract)<16)continue;b.fillStyle='#162e31df';const x=px(zone.x),y=pz(zone.z)-13;b.fillRect(x-43,y-12,86,19);b.fillStyle='#d2dcc9';b.fillText(zone.name,x,y+1);}
+      b.font='10px monospace';b.fillStyle='#a4bdb2';
+      for(let a=-40;a<=40;a+=20){b.fillText(String(a),px(a),height-14);b.fillText(String(a),15,pz(a)+3);}
+      b.textAlign='left';b.fillStyle='#a4bdb2';b.fillRect(width-95,height-24,10*scale,2);b.fillText('10 m',width-95,height-30);
+    }
+    mapBackgrounds.set(cacheKey,background);
+  }
+  ctx.clearRect(0,0,width,height);ctx.drawImage(mapBackgrounds.get(cacheKey),0,0);
+  if(player){
+    if(!mapRoute||elapsed-mapRoute.time>2||distance(player,mapRoute.start)>1.5){mapRoute={time:elapsed,start:{x:player.x,z:player.z},points:navigation.path(player,world.extract)};}
+    ctx.strokeStyle=large?'#95eac399':'#95eac355';ctx.lineWidth=large?2:1;ctx.setLineDash(large?[5,5]:[2,3]);
+    ctx.beginPath();ctx.moveTo(px(player.x),pz(player.z));for(const p of mapRoute.points)ctx.lineTo(px(p.x),pz(p.z));ctx.stroke();ctx.setLineDash([]);
+  }
+  ctx.fillStyle='#88e5b622';ctx.strokeStyle='#88e5b6';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(px(world.extract.x),pz(world.extract.z),world.extract.radius*scale,0,Math.PI*2);ctx.fill();ctx.stroke();
+  ctx.fillStyle='#a3f3bf';
   ctx.fillRect(px(world.extract.x)-2,pz(world.extract.z)-2,4,4);
-  for(const crate of crates){if(crate.empty)continue;ctx.fillStyle=crate.tier===3?'#edbd72':'#9cb8b1';const size=large?5:3;ctx.fillRect(px(crate.x)-size/2,pz(crate.z)-size/2,size,size);}
+  for(const crate of crates){if(crate.empty)continue;ctx.fillStyle=crate.tier===3?'#edbd72':'#bdcdc1';const size=large?6:3;ctx.save();ctx.translate(px(crate.x),pz(crate.z));ctx.rotate(Math.PI/4);ctx.fillRect(-size/2,-size/2,size,size);ctx.restore();}
   if(player){
     for(const enemy of enemies){if(!enemy.alive||distance(enemy,player)>22)continue;ctx.fillStyle=enemy.alert?'#ff785f':'#be7864';ctx.beginPath();ctx.arc(px(enemy.x),pz(enemy.z),large?3.5:2.5,0,Math.PI*2);ctx.fill();}
-    ctx.save();ctx.translate(px(player.x),pz(player.z));ctx.rotate(-yaw);ctx.fillStyle='#eaf9f3';ctx.beginPath();ctx.moveTo(0,-7);ctx.lineTo(-4.5,5);ctx.lineTo(0,3);ctx.lineTo(4.5,5);ctx.closePath();ctx.fill();ctx.restore();
+    ctx.save();ctx.translate(px(player.x),pz(player.z));ctx.rotate(-yaw);
+    ctx.fillStyle='#d7f9e213';ctx.beginPath();ctx.moveTo(0,0);ctx.arc(0,0,large?31:16,-Math.PI/2-.52,-Math.PI/2+.52);ctx.closePath();ctx.fill();
+    ctx.fillStyle='#eaf9f3';ctx.strokeStyle='#153b36';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,-7);ctx.lineTo(-4.5,5);ctx.lineTo(0,3);ctx.lineTo(4.5,5);ctx.closePath();ctx.stroke();ctx.fill();ctx.restore();
   }
-  ctx.fillStyle='#7f9692';ctx.font=`${large?13:10}px sans-serif`;ctx.textAlign='center';ctx.fillText('N',width/2,large?20:11);
+  ctx.font='12px sans-serif';ctx.textAlign='center';
   if(large){
-    ctx.font='12px sans-serif';
-    for(const zone of world.zones){ctx.fillStyle='#a9b8b2';ctx.fillText(zone.name,px(zone.x),pz(zone.z)-13);}
     ctx.fillStyle='#88e5b6';ctx.fillText('北岸撤离区',px(world.extract.x),pz(world.extract.z)-world.extract.radius*scale-10);
     ctx.fillStyle='#90a7a1';ctx.textAlign='left';ctx.fillText('南侧部署点',px(world.spawn.x)+10,pz(world.spawn.z)+5);
   }
@@ -436,6 +488,7 @@ function openOverlay(id) {
 function closeOverlay() { if(overlayReturn==='hud')resume();else setScreen(overlayReturn); }
 function applySettings() {
   audio.volume=settings.volume;
+  audio.musicVolume=settings.musicVolume;
   renderer.setPixelRatio(Math.min(devicePixelRatio,settings.quality==='low'?1:settings.quality==='medium'?1.25:1.6));
   renderer.shadowMap.enabled=settings.quality!=='low';
   try{localStorage.setItem('grayzone.settings',JSON.stringify(settings));}catch{}
@@ -447,8 +500,9 @@ $('settings-open').onclick=()=>openOverlay('settings');$('settings-close').oncli
 $('pause-settings').onclick=()=>openOverlay('settings');
 $('inventory-close').onclick=resume;$('map-close').onclick=resume;$('resume').onclick=resume;
 $('abort').onclick=()=>finishRaid(false,'主动结束行动，未能带出本局物资');
-$('sensitivity').value=settings.sensitivity;$('volume').value=settings.volume;$('quality').value=settings.quality;
-for(const id of ['sensitivity','volume','quality'])$(id).addEventListener('input',()=>{settings[id]=id==='quality'?$(id).value:Number($(id).value);applySettings();});
+$('sensitivity').value=settings.sensitivity;$('volume').value=settings.volume;$('music-volume').value=settings.musicVolume;$('quality').value=settings.quality;
+for(const id of ['sensitivity','volume','music-volume','quality'])$(id).addEventListener('input',()=>{settings[id==='music-volume'?'musicVolume':id]=id==='quality'?$(id).value:Number($(id).value);applySettings();});
+document.addEventListener('pointerdown',()=>audio.unlock(),{capture:true,once:true});
 
 window.addEventListener('keydown',event=>{
   if(['Tab','Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(event.code))event.preventDefault();
@@ -471,6 +525,8 @@ window.addEventListener('mousemove',event=>{
   if(state!=='hud'||document.pointerLockElement!==renderer.domElement)return;
   yaw-=event.movementX*.0021*settings.sensitivity*(aiming?.62:1);
   pitch=clamp(pitch-event.movementY*.0021*settings.sensitivity*(aiming?.62:1),-1.45,1.45);
+  weaponSway.x=clamp(weaponSway.x-event.movementX*.00018,-.025,.025);
+  weaponSway.y=clamp(weaponSway.y-event.movementY*.00014,-.018,.018);
 });
 renderer.domElement.addEventListener('mousedown',event=>{
   if(state!=='hud')return;
@@ -494,6 +550,7 @@ function animate(now) {
     elapsed+=dt;raidTime=Math.max(0,480-elapsed);
     updatePlayer(dt);updateAction(dt);updateEnemies(dt);
     hitTime=Math.max(0,hitTime-dt);hurtTime=Math.max(0,hurtTime-dt);muzzle.intensity=Math.max(0,muzzle.intensity-dt*38);
+    muzzleFlash.visible=muzzle.intensity>1;
     if(raidTime<=0)finishRaid(false,'行动窗口已关闭，未在时限内撤离');
     if(elapsed>35&&hintAt===0){hintAt=1;toast('按 M 查看地图。金色物资箱价值更高，绿色圆圈是撤离点。');}
     if(raidTime<60&&hintAt<2){hintAt=2;toast('剩余时间不足 1 分钟，立即前往北岸撤离区！','warn');}
@@ -502,6 +559,8 @@ function animate(now) {
     const angle=.45+Math.sin(lobbyTime*.07)*.11;
     camera.position.set(58*Math.sin(angle),28,58*Math.cos(angle));camera.lookAt(-3,1,-8);camera.fov=58;camera.updateProjectionMatrix();
   }
+  const threat=player&&state==='hud' ? clamp(enemies.reduce((sum,e)=>sum+(e.alive&&e.alert ? clamp(1-distance(e,player)/40,0,1)*.55 : 0),0),0,1) : 0;
+  audio.update(dt,{threat,extracting:action?.kind==='extract',paused:state!=='hud'&&state!=='lobby'&&state!=='result'&&!!player});
   for(const crate of crates){crate.beacon.rotation.y=lobbyTime*1.4;crate.beacon.position.y=1.3+Math.sin(lobbyTime*2+crate.x)*.1;}
   for(let i=effects.length-1;i>=0;i--){const e=effects[i];e.life-=dt;e.mesh.material.opacity=Math.max(0,e.life/e.maxLife);if(e.life<=0){scene.remove(e.mesh);e.mesh.geometry.dispose();e.mesh.material.dispose();effects.splice(i,1);}}
   renderer.render(scene,camera);
@@ -511,7 +570,7 @@ applySettings();renderLobby();setScreen('lobby');requestAnimationFrame(animate);
 // Explicit development-only integration seam, eliminated from production builds.
 if(import.meta.env.DEV&&new URLSearchParams(location.search).has('test')){
   window.__game={
-    snapshot:()=>({state,profile:structuredClone(profile),player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
+    snapshot:()=>({state,profile:structuredClone(profile),settings:{...settings},audio:audio.getDiagnostics(),player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
     teleport:(x,z)=>{if(player){player.x=x;player.z=z;camera.position.set(x,1.68,z);}},
     look:(y,p=0)=>{yaw=y;pitch=p;camera.rotation.set(p,y,0);camera.updateMatrixWorld(true);},
     damage:hurt,

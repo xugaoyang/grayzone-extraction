@@ -23,11 +23,17 @@ try{
   await page.goto((process.env.GAME_URL||'http://127.0.0.1:5173')+'/?test=1');
   await page.waitForFunction(()=>!!window.__game,{},{timeout:30000});
   check('lobby loads without JavaScript errors',errors.length===0);
+  check('audio waits for a player gesture',(await snapshot()).audio.contextState==='locked');
   await page.screenshot({path:'work/lobby.png'});
-  await page.click('#help-open');check('help opens',await page.isVisible('#help'));await page.click('#help-close');
-  await page.click('#settings-open');await page.selectOption('#quality','low');await page.click('#settings-close');
+  await page.click('#help-open');check('help opens',await page.isVisible('#help'));await page.waitForTimeout(200);
+  check('first interface click starts original lobby music',(await snapshot()).audio.musicRunning);await page.click('#help-close');
+  await page.click('#settings-open');await page.selectOption('#quality','low');
+  await page.locator('#music-volume').fill('0');await page.waitForTimeout(200);
+  check('music can be muted while effects remain enabled',(await snapshot()).audio.musicVolume===0&&(await snapshot()).audio.masterVolume===.5&&!(await snapshot()).audio.musicRunning);
+  await page.locator('#music-volume').fill('0.35');await page.click('#settings-close');
   await page.click('#deploy');await ensureActive();await page.evaluate(()=>window.__game.safe());
   let s=await snapshot();check('raid starts with eight enemies and twelve loot points',s.enemies.length===8&&s.crates.length===12&&s.player.ammo===24);
+  check('raid resumes adaptive score',s.audio.musicRunning&&s.audio.musicVolume===.35);
   check('mouse capture succeeds',s.locked);
   await page.evaluate(()=>window.__game.look(0,0));await page.waitForTimeout(120);await page.screenshot({path:'work/deployment.png'});
   const startZ=s.player.z;await hold('KeyW',450);s=await snapshot();check('W input moves player through 3D world',s.player.z<startZ-1);
@@ -47,6 +53,7 @@ try{
   await hold('KeyE',1000);s=await snapshot();check('dropped item can be recovered',s.player.loot.length===countBefore);
   await page.keyboard.press('KeyM');check('tactical map opens',await page.isVisible('#map-overlay'));await page.screenshot({path:'work/map.png'});await page.keyboard.press('KeyM');await ensureActive();
   await page.keyboard.press('Escape');await page.waitForTimeout(150);s=await snapshot();check('Escape pauses raid',s.state==='pause');
+  check('pause fades score and stops note scheduling',s.audio.mood==='pause'&&!s.audio.musicRunning);
   const pausedTime=s.elapsed;await page.waitForTimeout(400);check('pause freezes raid timer',(await snapshot()).elapsed===pausedTime);
   await page.click('#pause-settings');await page.click('#settings-close');check('settings returns to pause',await page.isVisible('#pause'));await page.click('#resume');await ensureActive();
   // Aim at a live enemy through an unobstructed nearby position; use real mouse shots.
@@ -64,7 +71,9 @@ try{
   await page.evaluate(()=>window.__game.look(0,-1.3));await page.waitForTimeout(150);await hold('KeyE',1000);
   check('looking down recovers dropped loot inside extraction zone',(await snapshot()).player.loot.length===extractBagCount);
   await page.evaluate(()=>window.__game.look(0,0));
-  await page.waitForTimeout(120);await hold('KeyE',1000);await page.waitForTimeout(100);s=await snapshot();check('releasing E cancels extraction',s.state==='hud'&&!s.action);
+  await page.waitForTimeout(120);await page.keyboard.down('KeyE');await page.waitForTimeout(600);
+  check('calling extraction switches the adaptive music layer',(await snapshot()).audio.mood==='extract');
+  await page.waitForTimeout(400);await page.keyboard.up('KeyE');await page.waitForTimeout(100);s=await snapshot();check('releasing E cancels extraction',s.state==='hud'&&!s.action);
   await page.keyboard.down('KeyE');await page.waitForFunction(()=>window.__game.snapshot().state==='result',{},{timeout:15000});await page.keyboard.up('KeyE');
   s=await snapshot();check('six-second extraction completes and pays correct rewards',s.profile.credits===creditsBefore+expectedLoot+kills*100+800&&s.profile.stats.extracts===1);
   await page.screenshot({path:'work/extraction.png'});
@@ -75,6 +84,7 @@ try{
   await page.click('#return-lobby');await page.locator('[data-kit="basic"]').click();await page.click('#deploy');await ensureActive();await page.evaluate(()=>{window.__game.safe();window.__game.setElapsed(481);});
   await page.waitForFunction(()=>window.__game.snapshot().state==='result');s=await snapshot();check('raid timeout ends action as failure',s.profile.stats.raids===3&&s.reason.includes('时限'));
   const finalProfile=s.profile;await page.reload();await page.waitForFunction(()=>!!window.__game);s=await snapshot();check('profile survives reload',JSON.stringify(s.profile)===JSON.stringify(finalProfile));
+  check('separate music level persists across reload',s.settings.musicVolume===.35&&s.audio.contextState==='locked');
   await page.setViewportSize({width:1280,height:720});await page.screenshot({path:'work/lobby-720.png'});
   const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth||document.documentElement.scrollHeight>innerHeight);
   check('lobby fits 1280x720 viewport',!overflow);
