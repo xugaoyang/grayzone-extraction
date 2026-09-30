@@ -49,6 +49,16 @@
 
 ## 开发
 
+### GitHub Pages 发布
+
+游戏可以作为静态网站发布到 GitHub Pages，玩家无需安装 Node.js，使用浏览器即可游玩。Vite 构建使用相对资源地址，兼容 `github.io` 的项目子目录。
+
+仓库的 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。`.github/workflows/pages.yml` 会在提交到 `main` 后自动安装依赖、运行逻辑测试、构建并发布，也可在 Actions 页面手动触发。
+
+GitHub Free 账号使用 Pages 时，承载网站的仓库需要公开。游戏的资金与升级仍保存在玩家自己的浏览器中，不会上传到 GitHub。线上地址与本地地址使用各自独立的存档。
+
+### 本地开发命令
+
 ```sh
 npm install
 npm run dev
