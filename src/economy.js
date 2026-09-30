@@ -2,9 +2,9 @@
 export const SAVE_KEY = 'grayzone-extraction.profile.v1';
 
 export const LOADOUTS = Object.freeze([
-  Object.freeze({ id: 'basic', name: '轻装侦察', cost: 0, damage: 32, magazine: 24, reserve: 96, armor: 20, medkits: 2, description: '免费补给。轻装步枪与基础护甲，随时重新出发。' }),
-  Object.freeze({ id: 'tactical', name: '战术突击', cost: 500, damage: 36, magazine: 30, reserve: 150, armor: 60, medkits: 3, description: '均衡突击套装。更多弹药与护甲，适合深入搜索。' }),
-  Object.freeze({ id: 'heavy', name: '重装先锋', cost: 1100, damage: 46, magazine: 24, reserve: 120, armor: 100, medkits: 4, description: '高威力步枪与重型护甲，正面突破敌方封锁。' }),
+  Object.freeze({ id: 'basic', weaponId: 'basic', name: '轻装侦察', cost: 0, damage: 32, magazine: 24, reserve: 96, armor: 20, medkits: 2, description: 'C9 冲锋枪：高射速、低后坐，适合近距离突入。免费补给，随时重新出发。' }),
+  Object.freeze({ id: 'tactical', weaponId: 'tactical', name: '战术突击', cost: 500, damage: 36, magazine: 30, reserve: 150, armor: 60, medkits: 3, description: 'AR4 突击步枪：中距均衡，可切换单发 / 自动；配备更多弹药与护甲。' }),
+  Object.freeze({ id: 'heavy', weaponId: 'heavy', name: '重装先锋', cost: 1100, damage: 46, magazine: 18, reserve: 120, armor: 100, medkits: 4, description: 'DMR7 精确步枪：半自动点射、18 发弹匣，高倍率瞄准与远距威力，配重型护甲。' }),
 ]);
 
 export const UPGRADES = Object.freeze([

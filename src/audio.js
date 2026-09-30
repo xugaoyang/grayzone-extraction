@@ -22,6 +22,7 @@ export class GameAudio {
     this._stepDuration = 60 / 78 / 2;
     this._musicVoices = new Set(); this._effectVoices = new Set();
     this._scheduledNotes = 0; this._visibilityListener = null;
+    this._shotEvents = 0; this._lastShotKind = null; this._lastReloadStage = null;
   }
   get volume() { return this._volume; }
   set volume(value) {
@@ -57,7 +58,16 @@ export class GameAudio {
   _buildGraph() {
     const c = this.context;
     this._master = c.createGain(); this._master.gain.value = this._volume; this._master.connect(c.destination);
-    this._effects = c.createGain(); this._effects.connect(this._master);
+    this._effects = c.createGain();
+    // Restrained bus compression keeps overlapping automatic fire comfortable.
+    // This is exclusively on effects; the music graph and mix are unchanged.
+    if (c.createDynamicsCompressor) {
+      this._effectsCompressor = c.createDynamicsCompressor();
+      this._effectsCompressor.threshold.value = -9; this._effectsCompressor.knee.value = 5;
+      this._effectsCompressor.ratio.value = 6; this._effectsCompressor.attack.value = .002;
+      this._effectsCompressor.release.value = .13;
+      this._effects.connect(this._effectsCompressor).connect(this._master);
+    } else this._effects.connect(this._master);
     this._musicGain = c.createGain(); this._musicGain.gain.value = this._musicVolume; this._musicGain.connect(this._master);
     this._transport = c.createGain(); this._transport.gain.value = 0; this._transport.connect(this._musicGain);
     this._layers = {};
@@ -257,22 +267,127 @@ export class GameAudio {
     source.connect(filter).connect(gain); this._voice(null, [source], gain, [filter], now + duration + .01, true);
     source.start(now, Math.random() * 6, duration + .01); source.stop(now + duration + .01);
   }
+  _composite(parts, level = 1, pitch = 1, position = 0) {
+    if (!this.context || this.context.state !== 'running' || this.volume <= 0 || this._hidden || level <= 0) return null;
+    const c = this.context, now = c.currentTime, gain = c.createGain(), mix = c.createGain(), sources = [], nodes = [mix];
+    gain.gain.value = level;
+    this._pan(mix, position, nodes).connect(gain);
+    let endTime = now;
+    for (const part of parts) {
+      const start = now + (part.delay || 0), duration = part.duration, end = start + duration;
+      const envelope = c.createGain(); nodes.push(envelope);
+      envelope.gain.setValueAtTime(.00001, start);
+      envelope.gain.linearRampToValueAtTime(part.level, start + Math.min(duration / 3, part.attack || .002));
+      envelope.gain.exponentialRampToValueAtTime(.00001, end);
+      let source, output;
+      if (part.type === 'noise') {
+        source = c.createBufferSource(); source.buffer = this._noise; output = source;
+        const filter = c.createBiquadFilter(); filter.type = part.filter || 'lowpass';
+        filter.frequency.value = part.frequency * pitch; filter.Q.value = part.Q || .7;
+        output.connect(filter); output = filter; nodes.push(filter);
+        if (part.highpass) {
+          const high = c.createBiquadFilter(); high.type = 'highpass'; high.frequency.value = part.highpass * pitch;
+          output.connect(high); output = high; nodes.push(high);
+        }
+      } else {
+        source = c.createOscillator(); source.type = part.type || 'sine'; output = source;
+        source.frequency.setValueAtTime(part.frequency * pitch, start);
+        source.frequency.exponentialRampToValueAtTime(Math.max(20, (part.endFrequency || part.frequency) * pitch), end);
+      }
+      output.connect(envelope).connect(mix); sources.push(source);
+      if (part.type === 'noise') source.start(start, Math.random() * 5.5, duration + .015);
+      else source.start(start);
+      source.stop(end + .015); endTime = Math.max(endTime, end + .015);
+    }
+    return this._voice(null, sources, gain, nodes, endTime, true);
+  }
+  _shotParts(kind, muffle = 1) {
+    if (kind === 'heavy') return [
+      { type: 'noise', duration: .145, level: .43, frequency: 2800 * muffle, highpass: 80 },
+      { type: 'sine', duration: .36, level: .28, frequency: 100, endFrequency: 31, attack: .004 },
+      { type: 'noise', duration: .32, level: .13, frequency: 550 * muffle, attack: .01 },
+      { type: 'noise', duration: .40, level: .09, frequency: 820 * muffle, delay: .13, attack: .022 },
+      { type: 'noise', duration: .09, level: .075, frequency: 1100 * muffle, filter: 'bandpass', delay: .11 },
+    ];
+    if (kind === 'tactical') return [
+      { type: 'noise', duration: .095, level: .34, frequency: 6800 * muffle, highpass: 750 },
+      { type: 'triangle', duration: .16, level: .19, frequency: 185, endFrequency: 58 },
+      { type: 'noise', duration: .065, level: .10, frequency: 2300 * muffle, filter: 'bandpass', Q: 1.2, delay: .095 },
+      { type: 'noise', duration: .24, level: .068, frequency: 1600 * muffle, highpass: 220, delay: .07, attack: .008 },
+    ];
+    return [
+      { type: 'noise', duration: .07, level: .38, frequency: 4500 * muffle, highpass: 420 },
+      { type: 'sine', duration: .115, level: .16, frequency: 145, endFrequency: 62 },
+      { type: 'noise', duration: .055, level: .06, frequency: 1800 * muffle, delay: .045 },
+    ];
+  }
+  shot(kind = 'basic') {
+    kind = ['basic', 'tactical', 'heavy'].includes(kind) ? kind : 'basic';
+    const voice = this._composite(this._shotParts(kind), 1, .97 + Math.random() * .06);
+    if (voice) { this._shotEvents++; this._lastShotKind = kind; }
+    return voice;
+  }
+  enemyShot(kind = 'tactical', distance = 12) {
+    const separation = Number.isFinite(distance) ? Math.max(0, distance) : 12;
+    const falloff = .28 / (1 + separation * .025), muffle = 1 / (1 + separation * .018);
+    return this._composite(this._shotParts(kind, muffle), falloff, .96 + Math.random() * .08, (Math.random() - .5) * .8);
+  }
+  reload(kind = 'basic', stage = 'start') {
+    const weight = kind === 'heavy' ? { pitch: .76, level: 1.12 } : kind === 'tactical' ? { pitch: 1, level: 1 } : { pitch: 1.18, level: .82 };
+    const stages = {
+      start: [
+        { type: 'noise', duration: .045, level: .11, frequency: 2600, filter: 'bandpass' },
+        { type: 'noise', duration: .16, level: .07, frequency: 1200, highpass: 350, delay: .018, attack: .025 },
+        { type: 'sine', duration: .055, level: .025, frequency: 115, endFrequency: 60, delay: .025 },
+      ],
+      magazine: [
+        { type: 'noise', duration: .17, level: .09, frequency: 800, highpass: 160, attack: .022 },
+        { type: 'noise', duration: .055, level: .14, frequency: 2100, filter: 'bandpass', delay: .12 },
+        { type: 'sine', duration: .075, level: .05, frequency: 92, endFrequency: 45, delay: .12 },
+      ],
+      bolt: [
+        { type: 'noise', duration: .08, level: .11, frequency: 3400, highpass: 900, attack: .008 },
+        { type: 'noise', duration: .055, level: .12, frequency: 2300, filter: 'bandpass', Q: 1.4, delay: .07 },
+        { type: 'noise', duration: .07, level: .055, frequency: 1400, filter: 'bandpass', delay: .028 },
+      ],
+    };
+    const voice = this._composite(stages[stage] || stages.start, weight.level, weight.pitch * (.98 + Math.random() * .04));
+    if (voice) this._lastReloadStage = stages[stage] ? stage : 'start';
+    return voice;
+  }
+  foley(name, level = 1) {
+    const walk = name === 'sprint' ? 1.35 : 1;
+    const parts = name === 'walk' || name === 'sprint' ? [
+      { type: 'noise', duration: .075, level: .08 * walk, frequency: name === 'sprint' ? 620 : 440, attack: .006 },
+      { type: 'sine', duration: .055, level: .028 * walk, frequency: 86, endFrequency: 40, delay: .003 },
+      { type: 'noise', duration: .065, level: .022 * walk, frequency: 1100, filter: 'bandpass', delay: .026, attack: .008 },
+    ] : name === 'gear' ? [
+      { type: 'noise', duration: .16, level: .055, frequency: 1700, highpass: 520, attack: .028 },
+    ] : name === 'pain' ? [
+      { type: 'noise', duration: .32, level: .09, frequency: 500, filter: 'bandpass', Q: .7, attack: .032 },
+      { type: 'noise', duration: .23, level: .035, frequency: 1550, filter: 'bandpass', Q: 1.1, delay: .08, attack: .044 },
+    ] : name === 'breath' ? [
+      { type: 'noise', duration: .38, level: .045, frequency: 1100, filter: 'bandpass', Q: .5, attack: .09 },
+    ] : null;
+    if (!parts) return null;
+    return this._composite(parts, clamp(level), .94 + Math.random() * .12);
+  }
   play(name) {
-    if (name === 'shot') { this.noise(.15, .42, 4400); this.tone(120, .13, 'triangle', .18, 35); }
-    if (name === 'enemy') this.noise(.13, .10, 1800);
+    if (name === 'shot') this.shot('basic');
+    if (name === 'enemy') this.enemyShot('tactical');
     if (name === 'hit') this.tone(760, .06, 'triangle', .12, 400);
     if (name === 'kill') { this.tone(550, .13, 'sine', .15, 1100); this.tone(1100, .2, 'sine', .06); }
     if (name === 'loot') { this.tone(720, .15, 'sine', .12, 960); this.tone(1440, .28, 'sine', .05); }
-    if (name === 'reload') this.noise(.16, .12, 2400);
-    if (name === 'step') this.noise(.07, .04, 700);
-    if (name === 'hurt') { this.noise(.18, .18, 450); this.tone(80, .18, 'sine', .13, 35); }
+    if (name === 'reload') this.reload('basic');
+    if (name === 'step') this.foley('walk');
+    if (name === 'hurt') { this.noise(.15, .14, 400); this.foley('pain'); }
     if (name === 'empty') this.tone(210, .04, 'square', .035);
     if (name === 'success') { this.tone(440, .5, 'sine', .1, 880); this.tone(660, .7, 'sine', .07); }
     if (name === 'fail') this.tone(160, .8, 'triangle', .12, 40);
     if (name === 'heal') this.tone(420, .4, 'sine', .07, 800);
   }
   getDiagnostics() {
-    return { contextState: this.context?.state ?? 'locked', masterVolume: this.volume, musicVolume: this.musicVolume, mood: this._paused ? 'pause' : this._mood, musicRunning: this._musicRunning, scheduledVoices: this._musicVoices.size, effectVoices: this._effectVoices.size, scheduledNotes: this._scheduledNotes, scoreStep: this._scoreStep, hidden: this._hidden };
+    return { contextState: this.context?.state ?? 'locked', masterVolume: this.volume, musicVolume: this.musicVolume, mood: this._paused ? 'pause' : this._mood, musicRunning: this._musicRunning, scheduledVoices: this._musicVoices.size, effectVoices: this._effectVoices.size, scheduledNotes: this._scheduledNotes, scoreStep: this._scoreStep, hidden: this._hidden, shotEvents: this._shotEvents, lastShotKind: this._lastShotKind, lastReloadStage: this._lastReloadStage };
   }
   dispose() {
     if (this._visibilityListener) document.removeEventListener('visibilitychange', this._visibilityListener);

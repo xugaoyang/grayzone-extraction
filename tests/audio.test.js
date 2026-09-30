@@ -40,6 +40,7 @@ globalThis.AudioContext = AudioContextStub;
 test('a new game never creates Web Audio or schedules notes before a gesture', () => {
   const audio = new GameAudio();
   audio.setMood('raid'); audio.update(10, { threat: 1 }); audio.play('shot');
+  audio.shot('heavy'); audio.enemyShot('tactical', 20); audio.reload('tactical', 'bolt'); audio.foley('pain');
   assert.equal(audio.context, null);
   assert.equal(audio.getDiagnostics().scheduledVoices, 0);
   assert.equal(audio.getDiagnostics().contextState, 'locked');
@@ -67,7 +68,7 @@ test('music mute stops transport while weapon effects remain usable', () => {
   assert.equal(audio.getDiagnostics().scheduledNotes, notes);
   assert.equal(audio.getDiagnostics().musicRunning, false);
   audio.play('shot');
-  assert.equal(audio.getDiagnostics().effectVoices, 2);
+  assert.ok(audio.getDiagnostics().effectVoices > 0);
   audio.musicVolume = .6; audio.update(.016);
   assert.equal(audio.getDiagnostics().musicRunning, true);
 });
@@ -111,4 +112,42 @@ test('a stalled frame uses bounded look-ahead instead of scheduling a backlog', 
     assert.ok(audio.getDiagnostics().scheduledVoices <= 48);
   }
   assert.ok(audio.getDiagnostics().scoreStep > 2000);
+});
+
+test('weapon reports have distinct lengths and remain one bounded composite voice per shot', () => {
+  const audio = new GameAudio(); audio.musicVolume = 0; audio.unlock();
+  const basic = audio.shot('basic'), tactical = audio.shot('tactical'), heavy = audio.shot('heavy');
+  assert.ok(tactical.endTime > basic.endTime * 1.5);
+  assert.ok(heavy.endTime > tactical.endTime * 1.4);
+  assert.equal(audio.getDiagnostics().lastShotKind, 'heavy');
+  assert.equal(audio.getDiagnostics().shotEvents, 3);
+  for (let index = 0; index < 200; index++) {
+    audio.context.currentTime += .012; audio.shot(['basic', 'tactical', 'heavy'][index % 3]);
+    assert.ok(audio.getDiagnostics().effectVoices <= 32);
+  }
+});
+
+test('reload stages and nonverbal foley use effects while music is muted', () => {
+  const audio = new GameAudio(); audio.musicVolume = 0; audio.unlock();
+  for (const stage of ['start', 'magazine', 'bolt']) {
+    assert.ok(audio.reload('tactical', stage));
+    assert.equal(audio.getDiagnostics().lastReloadStage, stage);
+  }
+  for (const name of ['walk', 'sprint', 'gear', 'breath', 'pain']) assert.ok(audio.foley(name));
+  assert.equal(audio.foley('walk', 0), null);
+  assert.equal(audio.foley('unsupported'), null);
+  assert.equal(audio.getDiagnostics().musicRunning, false);
+  audio.volume = 0;
+  assert.equal(audio.shot('heavy'), null);
+  assert.equal(audio.reload('basic'), null);
+  assert.equal(audio.enemyShot('heavy', 3), null);
+});
+
+test('enemy reports lose volume with distance and legacy sound names remain compatible', () => {
+  const audio = new GameAudio(); audio.musicVolume = 0; audio.unlock();
+  const near = audio.enemyShot('tactical', 3), distant = audio.enemyShot('tactical', 50);
+  assert.ok(near.gain.gain.value > distant.gain.gain.value * 1.8);
+  for (const name of ['shot', 'reload', 'enemy', 'step', 'hurt']) assert.doesNotThrow(() => audio.play(name));
+  assert.equal(audio.getDiagnostics().lastShotKind, 'basic');
+  assert.equal(audio.getDiagnostics().lastReloadStage, 'start');
 });

@@ -4,6 +4,9 @@ import { createWorld, createSoldier, createWeapon } from './world.js';
 import { LOADOUTS, UPGRADES, loadProfile, saveProfile, beginRaid, purchaseUpgrade, upgradeCost, getCapacity, rollLoot, settleRaid } from './economy.js';
 import { moveWithCollision, createNavigator, isBlocked } from './navigation.js';
 import { GameAudio } from './audio.js';
+import { getWeapon, damageAtDistance, needsTriggerRelease, nextFireMode } from './weapons.js';
+import { animateSoldier } from './actor-animation.js';
+import { CombatEffects } from './combat-effects.js';
 
 const $ = id => document.getElementById(id);
 const money = n => Math.round(n).toLocaleString('zh-CN');
@@ -41,7 +44,7 @@ $('viewport').append(renderer.domElement);
 renderer.domElement.setAttribute('aria-label', '灰域行动 3D 游戏画面');
 const world = createWorld(scene);
 const navigation = createNavigator(world.solids);
-const weapon = createWeapon();
+let weapon = createWeapon('basic'), weaponConfig=getWeapon('basic'), fireMode='auto';
 camera.add(weapon);
 weapon.position.set(.24, -.29, -.7);
 weapon.visible = false;
@@ -55,8 +58,11 @@ const ray = new THREE.Raycaster();
 const up = new THREE.Vector3(0,1,0);
 const keys = new Set();
 let mouseDown = false, aiming = false, yaw = 0, pitch = 0, recoil = 0;
+let shotKick=0, shotAge=10;
+let gaitPhase=0,motionEnvelope=0,viewRoll=0;
 const weaponSway = new THREE.Vector2();
-let player = null, enemies = [], crates = [], effects = [], raidTime = 480, elapsed = 0;
+let player = null, enemies = [], crates = [], raidTime = 480, elapsed = 0;
+const combatEffects=new CombatEffects(scene);
 let action = null, nearest = null, nextShot = 0, footstep = 0, hitTime = 0, hurtTime = 0, hintAt = 0;
 let raidNumber = 0, lastFrame = performance.now(), uiTime = 0, lobbyTime = 0, finishReason = '';
 let saveWarningShown = false;
@@ -95,7 +101,7 @@ function renderLobby() {
   $('credits').textContent = money(profile.credits);
   $('stats').innerHTML = `<span><b>${profile.stats.raids}</b> 次行动</span><span><b>${profile.stats.extracts}</b> 次撤离</span><span><b>${profile.stats.kills}</b> 次击败</span>`;
   $('contract-text').innerHTML = `物资回收 · 第 ${profile.contract.level} 阶段<br><strong>单次携带 ${profile.contract.target} 件物资成功撤离</strong><br><span>额外奖励 ₵ ${money(profile.contract.reward)}</span>`;
-  $('loadouts').innerHTML = LOADOUTS.map((kit, i) => `<button class="loadout-card ${selectedKit === kit.id ? 'selected' : ''}" data-kit="${kit.id}" aria-pressed="${selectedKit === kit.id}"><span class="card-index">0${i + 1}</span><span class="card-content"><strong>${kit.name}</strong><small>${kit.description}</small><span class="kit-spec">伤害 ${kit.damage + profile.upgrades.weapon * 3} &nbsp; 护甲 ${kit.armor + profile.upgrades.armor * 20}</span></span><b class="kit-price">${kit.cost ? '₵ ' + money(kit.cost) : '免费'}</b></button>`).join('');
+  $('loadouts').innerHTML = LOADOUTS.map((kit, i) => `<button class="loadout-card ${selectedKit === kit.id ? 'selected' : ''}" data-kit="${kit.id}" aria-pressed="${selectedKit === kit.id}"><span class="card-index">0${i + 1}</span><span class="card-content"><strong>${kit.name}</strong><small>${kit.description}</small><span class="kit-spec weapon-kit-name">${getWeapon(kit.weaponId).name} · ${kit.magazine} 发</span><span class="kit-spec">伤害 ${kit.damage + profile.upgrades.weapon * 3} &nbsp; 护甲 ${kit.armor + profile.upgrades.armor * 20}</span></span><b class="kit-price">${kit.cost ? '₵ ' + money(kit.cost) : '免费'}</b></button>`).join('');
   $('upgrades').innerHTML = UPGRADES.map(u => {
     const level = profile.upgrades[u.id], maxed = level >= u.maxLevel, cost = upgradeCost(profile, u.id);
     return `<button class="upgrade-card" data-upgrade="${u.id}" ${maxed || cost > profile.credits ? 'disabled' : ''} title="${u.description}"><span><strong>${u.name}</strong><small>${u.id === 'pack' ? '背包容量 ' + getCapacity(profile) : u.id === 'armor' ? '额外护甲 +' + level * 20 : '额外伤害 +' + level * 3}</small></span><span><i>${'▰'.repeat(level)}${'▱'.repeat(3-level)}</i><b>${maxed ? '已满级' : '₵ ' + money(cost)}</b></span></button>`;
@@ -133,8 +139,8 @@ function addCrate(spec, items = null) {
 function clearRaid() {
   enemies.forEach(e => { scene.remove(e.group); disposeGroup(e.group); });
   crates.forEach(c => { scene.remove(c.group); for (const mesh of c.group.children) { if (mesh.geometry !== crateBaseGeometry && mesh.geometry !== crateLidGeometry && mesh.geometry !== crateLineGeometry) mesh.geometry?.dispose(); if (!crateMaterials.includes(mesh.material)) mesh.material?.dispose(); } });
-  effects.forEach(e => { scene.remove(e.mesh); e.mesh.geometry.dispose(); e.mesh.material.dispose(); });
-  enemies = []; crates = []; effects = [];
+  combatEffects.clear();
+  enemies = []; crates = [];
 }
 function disposeGroup(group) {
   const geometries = new Set(), materials = new Set(), textures = new Set();
@@ -147,11 +153,16 @@ function deploy() {
   try { const start = beginRaid(profile, selectedKit); profile = start.profile; kit = start.loadout; }
   catch (error) { toast(error.message, 'warn'); return; }
   persist(); clearRaid(); raidNumber++;
+  camera.remove(weapon);weapon.remove(muzzle,muzzleFlash);disposeGroup(weapon);
+  weaponConfig=getWeapon(kit.weaponId);fireMode=weaponConfig.fireModes[0];
+  weapon=createWeapon(weaponConfig.id);camera.add(weapon);weapon.position.set(.24,-.29,-.7);
+  muzzle.position.copy(weapon.userData.muzzle);muzzleFlash.position.copy(weapon.userData.muzzle);weapon.add(muzzle,muzzleFlash);
+  muzzle.color.set(weaponConfig.flashColor);muzzleFlash.material.color.set(weaponConfig.flashColor);
   player = { x:world.spawn.x, z:world.spawn.z, health:100, armor:kit.armor, maxArmor:kit.armor, stamina:100, ammo:kit.magazine, reserve:kit.reserve, medkits:kit.medkits, kit, loot:[], kills:0, moving:false, sprinting:false, crouching:false };
   for (const spec of world.lootSpawns) addCrate(spec);
   for (const [i, spec] of world.enemySpawns.entries()) {
     const soldier = createSoldier();
-    const enemy = { ...soldier, x:spec.x, z:spec.z, home:{x:spec.x,z:spec.z}, health:i > 5 ? 100 : 80, alive:true, alert:false, lastKnown:null, memory:0, cooldown:1 + Math.random()*2, path:[], pathTimer:0, patrolTimer:i, phase:Math.random()*6, index:i };
+    const enemy = { ...soldier, x:spec.x, z:spec.z, home:{x:spec.x,z:spec.z}, health:i > 5 ? 100 : 80, alive:true, alert:false, lastKnown:null, memory:0, cooldown:1 + Math.random()*2, path:[], pathTimer:0, patrolTimer:i, phase:Math.random()*6, index:i, speed:0, notice:0, reaction:.32+i*.035, ready:0, hit:0, shot:0, burst:0, reposition:0, deathTime:null, behavior:'patrol' };
     enemy.group.position.set(spec.x,0,spec.z);
     enemy.bodyMeshes.forEach(m => { m.userData.enemy = enemy; m.userData.headshot = false; });
     enemy.headMeshes.forEach(m => { m.userData.enemy = enemy; m.userData.headshot = true; });
@@ -159,7 +170,7 @@ function deploy() {
   }
   elapsed = 0; raidTime = 480; action = null; nearest = null; nextShot = 0; hintAt = 0;
   hurtTime = 0; hitTime = 0; recoil = 0; yaw = 0; pitch = 0;
-  weaponSway.set(0,0); mapRoute = null;
+  weaponSway.set(0,0);mapRoute = null;shotKick=0;shotAge=10;gaitPhase=0;motionEnvelope=0;viewRoll=0;
   camera.position.set(player.x,1.68,player.z); camera.rotation.set(0,0,0);
   weapon.visible = true; setScreen('hud'); updateHUD(); audio.unlock(); lockPointer();
   toast('行动开始：先搜索前方物资箱。长按 E 搜索，M 查看撤离路线。');
@@ -188,7 +199,7 @@ function targetNearby() {
 function startReload() {
   if (state !== 'hud' || action || player.ammo >= player.kit.magazine) return;
   if (player.reserve <= 0) { toast('备弹耗尽，搜索物资箱或敌人掉落补给。','warn'); return; }
-  action = { kind:'reload', elapsed:0, duration:1.8 }; audio.play('reload');
+  action = { kind:'reload', elapsed:0, duration:weaponConfig.reloadTime, stage:0 };audio.reload(weaponConfig.id,'start');
 }
 function startHeal() {
   if (state !== 'hud' || action) return;
@@ -223,54 +234,53 @@ function updateAction(dt) {
   if (['search','extract'].includes(action.kind) && (!keys.has('KeyE') || distance(player,action.start) > .6 || !nearest || nearest.kind !== action.kind || (action.kind === 'search' && nearest.crate !== action.crate))) { action = null; return; }
   if (action.kind === 'heal' && player.sprinting) { action = null; toast('冲刺中断治疗。'); return; }
   action.elapsed += dt;
+  if(action.kind==='reload'){const p=action.elapsed/action.duration;if(p>.35&&action.stage===0){action.stage=1;audio.reload(weaponConfig.id,'magazine');}if(p>.82&&action.stage===1){action.stage=2;audio.reload(weaponConfig.id,'bolt');}}
   if (action.elapsed < action.duration) return;
   const completed = action; action = null;
-  if (completed.kind === 'reload') { const count = Math.min(player.kit.magazine-player.ammo,player.reserve); player.ammo += count; player.reserve -= count; audio.play('reload'); }
+  if (completed.kind === 'reload') { const count = Math.min(player.kit.magazine-player.ammo,player.reserve); player.ammo += count; player.reserve -= count; }
   if (completed.kind === 'heal') { player.health = Math.min(100, player.health + 65); player.medkits--; audio.play('heal'); toast('治疗完成 · 恢复 65 生命'); }
   if (completed.kind === 'search') { keys.delete('KeyE'); searchCrate(completed.crate); }
   if (completed.kind === 'extract') finishRaid(true, '物资已安全送达基地');
 }
 
 function addTracer(from,to,color = 0xffcb81) {
-  const geometry = new THREE.BufferGeometry().setFromPoints([from.clone(),to.clone()]);
-  const mesh = new THREE.Line(geometry,new THREE.LineBasicMaterial({color,transparent:true,opacity:.85}));
-  scene.add(mesh); effects.push({mesh,life:.08,maxLife:.08});
+  combatEffects.trace(from.clone(),to.clone(),color,weaponConfig.id==='heavy'?.11:.065);
 }
-function impact(point,color = 0xffc985) {
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(.065,4,3),new THREE.MeshBasicMaterial({color,transparent:true}));
-  mesh.position.copy(point); scene.add(mesh); effects.push({mesh,life:.16,maxLife:.16});
-}
-function shoot() {
+function shoot(pressed=false) {
   if (state !== 'hud' || action || nextShot > 0 || player.sprinting) return;
-  nextShot = player.kit.id === 'heavy' ? .19 : .14;
+  if(needsTriggerRelease(weaponConfig,fireMode)&&!pressed)return;
+  nextShot=weaponConfig.interval;
   if (player.ammo <= 0) { audio.play('empty'); startReload(); return; }
-  player.ammo--; audio.play('shot'); recoil = Math.min(.1,recoil + (aiming ? .022 : .04)); muzzle.intensity = 3; muzzleFlash.visible = true;
-  muzzleFlash.scale.set(.7+Math.random()*.5,.7+Math.random()*.5,2.2+Math.random());
+  player.ammo--;audio.shot(weaponConfig.id);recoil=Math.min(.15,recoil+weaponConfig.recoil*(aiming?.58:1));shotKick=weaponConfig.kick;shotAge=0;
+  muzzle.intensity=weaponConfig.flashSize*19;muzzleFlash.visible=true;
+  const flash=weaponConfig.flashSize/.13;muzzleFlash.scale.set(flash*(.6+Math.random()*.4),flash*(.6+Math.random()*.4),flash*(1.9+Math.random()));
   camera.updateMatrixWorld(true); scene.updateMatrixWorld(true);
   const direction = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
-  const spread = aiming ? .003 : player.moving ? .021 : .011;
+  const spread=(aiming?weaponConfig.adsSpread:player.moving?weaponConfig.moveSpread:weaponConfig.hipSpread)*(player.crouching?.72:1)+recoil*.025;
   direction.x += (Math.random()-.5)*spread; direction.y += (Math.random()-.5)*spread; direction.z += (Math.random()-.5)*spread; direction.normalize();
-  ray.set(camera.position,direction); ray.far=150; ray.near=.1;
+  ray.set(camera.position,direction);ray.far=weaponConfig.range;ray.near=.1;
   const meshes = enemies.filter(e => e.alive).flatMap(e => [...e.bodyMeshes,...e.headMeshes]);
   const hits = ray.intersectObjects([...world.blockers,...meshes],false);
-  const point = hits[0]?.point || camera.position.clone().addScaledVector(direction,100);
-  addTracer(weapon.localToWorld(weapon.userData.muzzle.clone()),point);
+  const point = hits[0]?.point || camera.position.clone().addScaledVector(direction,weaponConfig.range);
+  addTracer(weapon.localToWorld(weapon.userData.muzzle.clone()),point,weaponConfig.tracerColor);combatEffects.shot(weapon,weaponConfig,camera);
   if (hits[0]) {
     const enemy = hits[0].object.userData.enemy;
-    impact(point, enemy ? 0x9fffc7 : 0xffc985);
+    const normal=hits[0].face?.normal.clone().transformDirection(hits[0].object.matrixWorld);
+    combatEffects.impact(point,normal,hits[0].object.material?.metalness>.2,!!enemy);
     if (enemy) {
       const headshot = hits[0].object.userData.headshot;
-      enemy.health -= player.kit.damage * (headshot ? 2.15 : 1);
+      enemy.health-=damageAtDistance(weaponConfig,player.kit.damage,hits[0].distance)*(headshot?2.15:1);enemy.hit=1;enemy.reposition=0;
+      audio.foley('pain',.4*clamp(1-distance(enemy,player)/40,.1,1));
       enemy.alert = true; enemy.lastKnown = {x:player.x,z:player.z}; enemy.memory = 12;
       hitTime = .15; $('hitmarker').classList.toggle('headshot',headshot); audio.play('hit');
       if (enemy.health <= 0) killEnemy(enemy,headshot);
     }
   }
-  for (const enemy of enemies) if (enemy.alive && distance(enemy,player) < 28) { enemy.alert = true; enemy.lastKnown = {x:player.x,z:player.z}; enemy.memory = 12; }
+  for (const enemy of enemies) if (enemy.alive && distance(enemy,player) < weaponConfig.noiseRadius) { enemy.alert = true; enemy.lastKnown = {x:player.x,z:player.z}; enemy.memory = 12; }
 }
 function killEnemy(enemy,headshot) {
   if (!enemy.alive) return;
-  enemy.alive = false; enemy.group.rotation.z = Math.PI / 2; enemy.group.position.y = .35;
+  enemy.alive=false;enemy.deathTime=0;enemy.path=[];enemy.behavior='fallen';
   player.kills++; audio.play('kill'); toast(`${headshot ? '精准命中 · ' : ''}击败守卫 · 撤离后奖励 ₵ 100`);
   addCrate({x:enemy.x,z:enemy.z,tier:2,label:'守卫战利品'},rollLoot(2));
 }
@@ -283,47 +293,82 @@ function hurt(damage) {
   if (player.health <= 0) { player.health = 0; finishRaid(false, '行动中失去战斗能力'); }
 }
 
+function repositionGuard(enemy,takeCover=false) {
+  const toward=Math.atan2(player.x-enemy.x,player.z-enemy.z),side=enemy.index%2?1:-1;
+  let goal=null;
+  if(takeCover){
+    let best=Infinity;
+    for(const s of world.solids){if(s.height<1.4||s.maxX-s.minX>40||s.maxZ-s.minZ>40)continue;
+      const midX=(s.minX+s.maxX)/2,midZ=(s.minZ+s.maxZ)/2;
+      for(const p of [{x:s.minX-.95,z:midZ},{x:s.maxX+.95,z:midZ},{x:midX,z:s.minZ-.95},{x:midX,z:s.maxZ+.95}]){
+        const d=distance(p,enemy);if(d>9||d<1||isBlocked(p.x,p.z,world.solids,.55)||lineClear(player,p,1.3))continue;
+        if(d<best){goal=p;best=d;}
+      }
+    }
+  }
+  if(!goal){
+    for(const sign of [side,-side]){const p={x:enemy.x+Math.cos(toward)*sign*(2+Math.random()*1.5),z:enemy.z-Math.sin(toward)*sign*(2+Math.random()*1.5)};
+      if(!isBlocked(p.x,p.z,world.solids,.55)&&Math.abs(p.x)<46&&Math.abs(p.z)<46){goal=p;break;}}
+  }
+  enemy.path=goal?navigation.path(enemy,goal):[];enemy.reposition=3+Math.random()*2;enemy.behavior=takeCover&&goal?'cover':'reposition';enemy.pathTimer=1.5;
+}
 function updateEnemies(dt) {
   for (const enemy of enemies) {
-    if (!enemy.alive || state !== 'hud') continue;
+    if(state!=='hud')continue;
+    if(!enemy.alive){
+      enemy.deathTime+=dt;const t=clamp(enemy.deathTime/.85,0,1),fall=THREE.MathUtils.smoothstep(t,0,1);
+      enemy.group.rotation.z=(enemy.index%2?1:-1)*fall*1.4;enemy.group.position.y=fall*.27;
+      animateSoldier(enemy,dt,{time:elapsed+enemy.phase,dead:enemy.deathTime});continue;
+    }
     const dist = distance(enemy,player);
-    enemy.cooldown -= dt; enemy.pathTimer -= dt; enemy.memory -= dt; enemy.patrolTimer -= dt;
+    enemy.cooldown-=dt;enemy.pathTimer-=dt;enemy.memory-=dt;enemy.patrolTimer-=dt;enemy.reposition-=dt;enemy.hit=Math.max(0,enemy.hit-dt*3.5);enemy.shot=Math.max(0,enemy.shot-dt*8);
     const awareness = player.sprinting ? 29 : player.crouching ? 16 : 24;
     const visible = dist < awareness && lineClear(enemy,player,player.crouching ? .85 : 1.3);
-    if (visible) { enemy.alert = true; enemy.lastKnown = {x:player.x,z:player.z}; enemy.memory = 9; }
-    if (enemy.memory <= 0 && enemy.alert) { enemy.alert = false; enemy.path=[]; }
+    const heading=enemy.group.rotation.y+(enemy.rig?.head.rotation.y||0),facing=(Math.sin(heading)*(player.x-enemy.x)+Math.cos(heading)*(player.z-enemy.z))/Math.max(.1,dist);
+    if(visible&&(enemy.alert||facing>.2||dist<5)){enemy.notice+=dt;if(enemy.notice>=enemy.reaction){enemy.alert=true;enemy.lastKnown={x:player.x,z:player.z};enemy.memory=9;}}
+    else enemy.notice=Math.max(0,enemy.notice-dt*2);
+    if(enemy.memory<=0&&enemy.alert){enemy.alert=false;enemy.path=[];enemy.burst=0;enemy.patrolTimer=1.2;}
+    enemy.ready=THREE.MathUtils.damp(enemy.ready,enemy.alert?1:0,4,dt);
+    let desiredYaw=enemy.group.rotation.y;
     if (enemy.alert && enemy.lastKnown) {
-      if (enemy.pathTimer <= 0) { enemy.path = navigation.path(enemy,enemy.lastKnown); enemy.pathTimer = 1.25 + enemy.index*.06; }
-      enemy.group.rotation.y = Math.atan2(player.x-enemy.x,player.z-enemy.z);
-      if (visible && dist < 24 && enemy.cooldown <= 0) {
-        enemy.cooldown = 1.05 + Math.random()*.85;
-        const from = new THREE.Vector3(enemy.x,1.36,enemy.z), to = camera.position.clone();
-        const chance = clamp(.78 - dist*.013 - (player.sprinting ? .2 : 0) - (player.crouching ? .08 : 0),.17,.75);
+      desiredYaw=Math.atan2(enemy.lastKnown.x-enemy.x,enemy.lastKnown.z-enemy.z);
+      if(enemy.hit>.45&&enemy.reposition<=0)repositionGuard(enemy,true);
+      else if(visible&&dist<22&&enemy.reposition<=0)repositionGuard(enemy,false);
+      else if(!visible&&enemy.pathTimer<=0){enemy.path=navigation.path(enemy,enemy.lastKnown);enemy.pathTimer=1.5+enemy.index*.07;enemy.behavior='search';}
+      const targetAngle=Math.atan2(player.x-enemy.x,player.z-enemy.z),aimDelta=Math.atan2(Math.sin(targetAngle-enemy.group.rotation.y),Math.cos(targetAngle-enemy.group.rotation.y));
+      if(visible&&dist<26&&enemy.ready>.7&&Math.abs(aimDelta)<.24&&enemy.cooldown<=0&&enemy.hit<.35){
+        if(enemy.burst<=0)enemy.burst=2+(Math.random()<.25?1:0);enemy.burst--;
+        enemy.cooldown=enemy.burst>0?.18:1.6+Math.random()*.8;enemy.shot=1;enemy.behavior='engage';
+        enemy.group.updateMatrixWorld(true);
+        const rifle=enemy.rig?.rifle,from=rifle?.userData.muzzle?rifle.localToWorld(rifle.userData.muzzle.clone()):new THREE.Vector3(enemy.x,1.36,enemy.z),to=camera.position.clone();
+        const chance=clamp(.5-dist*.009-(player.sprinting?.16:0)-(player.crouching?.06:0),.12,.48);
         const hit = Math.random() < chance;
         if (!hit) to.add(new THREE.Vector3((Math.random()-.5)*2.5,.5,0));
-        addTracer(from,to,0xff875c); audio.play('enemy');
-        if (hit) hurt(10 + Math.random()*5);
+        addTracer(from,to,0xff875c);audio.enemyShot('tactical',dist);combatEffects.smoke(from,.045,.3);
+        if(hit)hurt(7+Math.random()*4);
       }
-    } else if (enemy.patrolTimer <= 0 || enemy.path.length === 0) {
-      enemy.patrolTimer = 5 + Math.random()*5;
+    } else if(enemy.patrolTimer<=0&&enemy.path.length===0){
+      enemy.patrolTimer=4+Math.random()*4;enemy.behavior='patrol';
       const angle = Math.random()*Math.PI*2, r = 4+Math.random()*5;
       enemy.path = navigation.path(enemy,{x:clamp(enemy.home.x+Math.sin(angle)*r,-45,45),z:clamp(enemy.home.z+Math.cos(angle)*r,-45,45)});
     }
-    let walking = false;
-    if (enemy.path.length && !(visible && dist < 12)) {
+    const previous={x:enemy.x,z:enemy.z};
+    const moveTarget=enemy.path.length&&enemy.hit<.5 ? enemy.alert?(visible?1.65:2.45):1.15:0;
+    enemy.speed=THREE.MathUtils.damp(enemy.speed,moveTarget,5,dt);
+    if(enemy.path.length&&enemy.hit<.5){
       const target = enemy.path[0], d = distance(enemy,target);
-      if (d < .65) enemy.path.shift();
+      if(d<.55){enemy.path.shift();if(!enemy.path.length&&!enemy.alert){enemy.patrolTimer=1.2+Math.random()*2.2;enemy.behavior='observe';}}
       else {
-        const speed = enemy.alert ? 2.5 : 1.15;
         const dx=(target.x-enemy.x)/d,dz=(target.z-enemy.z)/d;
-        moveWithCollision(enemy,dx*dt*speed,dz*dt*speed,world.solids,.42);
-        if (!visible) enemy.group.rotation.y = Math.atan2(dx,dz);
-        walking=true;
+        moveWithCollision(enemy,dx*dt*enemy.speed,dz*dt*enemy.speed,world.solids,.42);
+        if(!visible||!enemy.alert)desiredYaw=Math.atan2(dx,dz);
       }
     }
+    const delta=Math.atan2(Math.sin(desiredYaw-enemy.group.rotation.y),Math.cos(desiredYaw-enemy.group.rotation.y)),turn=clamp(delta*(1-Math.exp(-dt*7)),-dt*3.4,dt*3.4);
+    enemy.group.rotation.y+=turn;
     enemy.group.position.x=enemy.x; enemy.group.position.z=enemy.z;
-    const swing = walking ? Math.sin(elapsed*8+enemy.phase)*.38 : 0;
-    if (enemy.limbs) { enemy.limbs.leftLeg.rotation.x=swing; enemy.limbs.rightLeg.rotation.x=-swing; }
+    const velocityX=(enemy.x-previous.x)/Math.max(dt,.001),velocityZ=(enemy.z-previous.z)/Math.max(dt,.001),bodyYaw=enemy.group.rotation.y;
+    animateSoldier(enemy,dt,{time:elapsed+enemy.phase,speed:Math.hypot(velocityX,velocityZ),moveX:Math.cos(bodyYaw)*velocityX-Math.sin(bodyYaw)*velocityZ,moveZ:Math.sin(bodyYaw)*velocityX+Math.cos(bodyYaw)*velocityZ,alert:enemy.alert,aimPitch:visible?Math.atan2(camera.position.y-1.4,Math.max(1,dist)):0,turn:turn/Math.max(dt,.001),hit:Math.max(enemy.hit,enemy.shot*.2),dead:null});
   }
 }
 
@@ -340,23 +385,32 @@ function updatePlayer(dt) {
   const dz = (-Math.sin(yaw)*side - Math.cos(yaw)*forward) / normal;
   moveWithCollision(player,dx*speed*dt,dz*speed*dt,world.solids,.38);
   player.x = clamp(player.x,-48,48); player.z=clamp(player.z,-48,48);
-  const bob = player.moving ? Math.sin(elapsed*(player.sprinting?15:10))*(player.crouching?.014:.032) : 0;
+  motionEnvelope=THREE.MathUtils.damp(motionEnvelope,player.moving?1:0,8,dt);gaitPhase+=dt*(player.sprinting?15:player.crouching?7:10)*motionEnvelope;
+  const bob=Math.sin(gaitPhase)*(player.crouching?.014:player.sprinting?.043:.024)*motionEnvelope;
   camera.position.x=player.x; camera.position.z=player.z;
-  camera.position.y=THREE.MathUtils.damp(camera.position.y,(player.crouching?1.04:1.68)+bob,14,dt);
-  recoil = Math.max(0,recoil-dt*.2);
-  camera.rotation.set(pitch+recoil,yaw,0);
-  const fov = aiming ? 49 : player.sprinting ? 83 : 76;
+  camera.position.y=THREE.MathUtils.damp(camera.position.y,(player.crouching?1.04:1.68)+bob+Math.sin(elapsed*1.6)*.002,14,dt);
+  recoil=Math.max(0,recoil-dt*(weaponConfig.id==='heavy'?.2:.27));shotKick=THREE.MathUtils.damp(shotKick,0,18,dt);shotAge+=dt;
+  viewRoll=THREE.MathUtils.damp(viewRoll,-side*.014*motionEnvelope*(aiming?.3:1),8,dt);
+  camera.rotation.set(pitch+recoil,yaw,viewRoll);
+  const fov=aiming?weaponConfig.adsFov:player.sprinting?83:76;
   camera.fov = THREE.MathUtils.damp(camera.fov,fov,12,dt); camera.updateProjectionMatrix();
   weaponSway.multiplyScalar(Math.exp(-dt*10));
   const reloadPose = action?.kind === 'reload' ? Math.sin(Math.PI*clamp(action.elapsed/action.duration,0,1)) : 0;
   const breath = Math.sin(elapsed*1.8)*.0025;
   const drift = aiming ? .08 : 1;
   const carry = player.sprinting ? .12 : 0;
-  weapon.position.set(THREE.MathUtils.damp(weapon.position.x,(aiming ? 0 : .24)+weaponSway.x*drift,14,dt),THREE.MathUtils.damp(weapon.position.y,(aiming ? -.192 : -.29)+breath*drift-carry-reloadPose*.11,14,dt) - Math.abs(bob)*.18*drift, THREE.MathUtils.damp(weapon.position.z,(aiming ? -.65 : -.7)+reloadPose*.12,14,dt) + recoil*.2);
+  weapon.position.set(THREE.MathUtils.damp(weapon.position.x,(aiming ? 0 : .24)+weaponSway.x*drift+Math.cos(gaitPhase*.5)*.008*motionEnvelope*drift,14,dt),THREE.MathUtils.damp(weapon.position.y,(aiming ? -.192 : -.29)+breath*drift-carry-reloadPose*.11,14,dt) - Math.abs(bob)*.18*drift, THREE.MathUtils.damp(weapon.position.z,(aiming ? -.65 : -.7)+reloadPose*.12+shotKick,20,dt));
   weapon.rotation.set(THREE.MathUtils.damp(weapon.rotation.x,-reloadPose*.48-(player.sprinting ? .28 : 0)+weaponSway.y*drift,14,dt),THREE.MathUtils.damp(weapon.rotation.y,weaponSway.x*drift*.5,14,dt),THREE.MathUtils.damp(weapon.rotation.z,action?.kind==='heal' ? -.7 : reloadPose*.45-(player.sprinting ? .2 : 0),14,dt));
-  if(weapon.userData.parts?.magazine){const mag=weapon.userData.parts.magazine;mag.position.y=-reloadPose*.23;mag.rotation.x=reloadPose*.18;}
+  for(const [name,part] of Object.entries(weapon.userData.parts||{})){
+    if(!part?.isObject3D||name==='casingEject')continue;
+    const pos=part.userData.restPosition??=part.position.clone(),rot=part.userData.restRotation??=part.rotation.clone();part.position.copy(pos);part.rotation.copy(rot);
+    if(name==='magazine'){part.position.y-=reloadPose*.25;part.rotation.x+=reloadPose*.2;}
+    if(name==='bolt'){part.position.z+=Math.exp(-shotAge*28)*.038+(action?.kind==='reload'&&action.elapsed/action.duration>.8?Math.sin((action.elapsed/action.duration-.8)*Math.PI*5)*.045:0);}
+    if(name==='leftHand'){part.position.x-=reloadPose*.08;part.position.y-=reloadPose*.14;part.position.z+=reloadPose*.14;part.rotation.z-=reloadPose*.28;}
+    if(name==='rightHand')part.rotation.x-=Math.exp(-shotAge*32)*.022;
+  }
   footstep -= dt;
-  if (player.moving && footstep <= 0) { footstep = player.sprinting ? .28 : .44; audio.play('step'); }
+  if(player.moving&&footstep<=0){footstep=player.sprinting?.28:player.crouching?.58:.44;audio.foley(player.sprinting?'sprint':'walk',player.crouching?.45:1);}
   nextShot = Math.max(0,nextShot-dt);
   if (mouseDown && document.pointerLockElement === renderer.domElement) shoot();
 }
@@ -431,7 +485,8 @@ function updateHUD() {
   $('stamina-fill').style.width=`${player.stamina}%`;
   $('ammo-current').textContent=String(player.ammo).padStart(2,'0');$('ammo-reserve').textContent=player.reserve;
   $('ammo-current').classList.toggle('urgent',player.ammo<6);
-  $('weapon-name').textContent=player.kit.id==='heavy'?'BR-46 / 精确步枪':player.kit.id==='tactical'?'AR-36 / 突击步枪':'SR-32 / 侦察步枪';
+  $('weapon-name').textContent=weaponConfig.name;
+  $('fire-mode').textContent=fireMode==='semi'?'单发':'自动';$('fire-mode-hint').hidden=weaponConfig.fireModes.length<2;
   $('medkit-count').textContent=player.medkits;
   $('bag-summary').textContent=`${currentWeight()} / ${player.kit.capacity} KG · ₵ ${money(lootValue())}`;
   $('kill-count').textContent=player.kills;
@@ -517,6 +572,7 @@ window.addEventListener('keydown',event=>{
   keys.add(event.code);
   if(event.code==='KeyR')startReload();
   if(event.code==='KeyF')startHeal();
+  if(event.code==='KeyB'&&weaponConfig.fireModes.length>1&&!action){fireMode=nextFireMode(weaponConfig,fireMode);mouseDown=false;audio.reload(weaponConfig.id,'bolt');toast(`射击模式：${fireMode==='semi'?'单发点射':'全自动'} · B 切换`);}
   if(event.code==='Tab')openOverlay('inventory');
   if(event.code==='KeyM')openOverlay('map-overlay');
 });
@@ -532,7 +588,7 @@ renderer.domElement.addEventListener('mousedown',event=>{
   if(state!=='hud')return;
   audio.unlock();
   if(document.pointerLockElement!==renderer.domElement){lockPointer();return;}
-  if(event.button===0){mouseDown=true;if(action?.kind==='heal')action=null;shoot();}
+  if(event.button===0){mouseDown=true;if(action?.kind==='heal')action=null;shoot(true);}
   if(event.button===2)aiming=true;
 });
 window.addEventListener('mouseup',event=>{if(event.button===0)mouseDown=false;if(event.button===2)aiming=false;});
@@ -562,7 +618,7 @@ function animate(now) {
   const threat=player&&state==='hud' ? clamp(enemies.reduce((sum,e)=>sum+(e.alive&&e.alert ? clamp(1-distance(e,player)/40,0,1)*.55 : 0),0),0,1) : 0;
   audio.update(dt,{threat,extracting:action?.kind==='extract',paused:state!=='hud'&&state!=='lobby'&&state!=='result'&&!!player});
   for(const crate of crates){crate.beacon.rotation.y=lobbyTime*1.4;crate.beacon.position.y=1.3+Math.sin(lobbyTime*2+crate.x)*.1;}
-  for(let i=effects.length-1;i>=0;i--){const e=effects[i];e.life-=dt;e.mesh.material.opacity=Math.max(0,e.life/e.maxLife);if(e.life<=0){scene.remove(e.mesh);e.mesh.geometry.dispose();e.mesh.material.dispose();effects.splice(i,1);}}
+  if(state==='hud'||state==='lobby')combatEffects.update(dt);
   renderer.render(scene,camera);
 }
 applySettings();renderLobby();setScreen('lobby');requestAnimationFrame(animate);
@@ -570,7 +626,7 @@ applySettings();renderLobby();setScreen('lobby');requestAnimationFrame(animate);
 // Explicit development-only integration seam, eliminated from production builds.
 if(import.meta.env.DEV&&new URLSearchParams(location.search).has('test')){
   window.__game={
-    snapshot:()=>({state,profile:structuredClone(profile),settings:{...settings},audio:audio.getDiagnostics(),player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
+    snapshot:()=>({state,profile:structuredClone(profile),settings:{...settings},audio:audio.getDiagnostics(),weapon:{id:weaponConfig.id,fireMode,fov:camera.fov,recoil,kick:shotKick,position:weapon.position.toArray(),muzzle:weapon.userData.muzzle.toArray(),particles:combatEffects.particles.length},player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,actionProgress:action?{elapsed:action.elapsed,duration:action.duration}:null,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health,yaw:e.group.rotation.y,roll:e.group.rotation.z,alert:e.alert,behavior:e.behavior,deathTime:e.deathTime,speed:e.speed,pose:e.rig?{head:e.rig.head.rotation.toArray().slice(0,3),knee:e.rig.left.knee.rotation.x,elbow:e.rig.left.elbow.rotation.x,torso:e.rig.torso.position.toArray()}:null})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
     teleport:(x,z)=>{if(player){player.x=x;player.z=z;camera.position.set(x,1.68,z);}},
     look:(y,p=0)=>{yaw=y;pitch=p;camera.rotation.set(p,y,0);camera.updateMatrixWorld(true);},
     damage:hurt,

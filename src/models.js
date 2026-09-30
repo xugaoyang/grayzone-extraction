@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { animateSoldier } from './actor-animation.js';
 
 // Original procedural models. Shape detail lives in geometry, so these models
 // also work in Node and do not depend on downloaded assets or canvas textures.
@@ -86,7 +87,7 @@ function assembler(root, hitLists = null) {
     add(parent, bevelBox(...size, bevel), mat, position, rotation, [1, 1, 1], head);
   }
   function ellipsoid(parent, position, radii, mat, head = false, segments = 10) {
-    add(parent, new THREE.SphereGeometry(1, segments, hitLists ? 5 : 6), mat, position, [0, 0, 0], radii, head);
+    add(parent, new THREE.SphereGeometry(1, segments, head && segments >= 12 ? 10 : hitLists ? 5 : 6), mat, position, [0, 0, 0], radii, head);
   }
   function bone(parent, start, end, radius, mat, head = false, endRadius = radius) {
     const a = new THREE.Vector3(...start), b = new THREE.Vector3(...end);
@@ -139,8 +140,10 @@ function rifleMaterials(detailed = true) {
 }
 
 /** Modern original carbine. Forward is -Z; the handle is close to the origin. */
-function buildCarbine(group, a, detailed = true) {
+function buildCarbine(group, a, detailed = true, kind = 'tactical') {
   const m = rifleMaterials(detailed);
+  if (kind === 'basic') { m.tan.color.setHex(0x465158); m.polymer.color.setHex(0x242e31); }
+  if (kind === 'heavy') { m.tan.color.setHex(0x646951); m.polymer.color.setHex(0x222821); }
   const box = (size, position, mat, rotation, bevel) => a.box(group, size, position, mat, rotation, false, bevel);
   const profile = (points, width, mat, holes = [], position = [0, 0, 0], bevel = .004, parent = group) =>
     a.add(parent, sideProfile(points, width, holes, bevel), mat, position);
@@ -149,7 +152,8 @@ function buildCarbine(group, a, detailed = true) {
   profile([[.012, .098], [.015, -.178], [-.027, -.208], [-.075, -.177], [-.091, -.056], [-.052, .091]], .098, m.tan);
   // Exposed barrel extension, receiver pins, ejection port and charging handle.
   box([.015, .041, .112], [.061, .024, -.065], m.polymer, undefined, .004);
-  box([.009, .015, .081], [.071, .025, -.058], m.bright, undefined, .002);
+  const bolt = new THREE.Group(); bolt.name = 'Reciprocating bolt'; bolt.position.set(.071, .025, -.058); group.add(bolt);
+  a.box(bolt, [.009, .015, .081], [0, 0, 0], m.bright, undefined, false, .002);
   box([.044, .017, .048], [.078, .049, -.012], m.steel, [0, .19, 0], .003);
   box([.17, .013, .025], [0, .072, .107], m.polymer, undefined, .003);
   if (detailed) {
@@ -201,16 +205,34 @@ function buildCarbine(group, a, detailed = true) {
   profile([[-.06, .061], [-.138, .067], [-.146, -.055], [-.065, -.066]], .035, m.polymer,
     [[[-.073, .05], [-.121, .051], [-.128, -.042], [-.073, -.05]]], [0, 0, 0], .002);
   a.add(group, new THREE.TorusGeometry(.02, .004, 4, 10, Math.PI * 1.05), m.bright, [0, -.094, .001], [0, Math.PI / 2, -.5]);
-  const magazine = new THREE.Group(); magazine.name = 'Curved detachable magazine'; group.add(magazine);
-  profile([[-.067, -.057], [-.159, -.051], [-.255, -.075], [-.322, -.111], [-.324, -.178], [-.248, -.172], [-.153, -.149], [-.071, -.143]], .079, m.polymer, [], [0, 0, 0], .005, magazine);
-  a.box(magazine, [.088, .015, .089], [0, -.325, -.143], m.rubber, [.18, 0, 0], false, .004);
+  const magazine = new THREE.Group(); magazine.name = 'Detachable magazine'; group.add(magazine);
+  const magazineProfiles = {
+    basic: [[-.067, -.073], [-.362, -.082], [-.366, -.145], [-.067, -.137]],
+    tactical: [[-.067, -.057], [-.159, -.051], [-.255, -.075], [-.322, -.111], [-.324, -.178], [-.248, -.172], [-.153, -.149], [-.071, -.143]],
+    heavy: [[-.067, -.054], [-.245, -.056], [-.265, -.075], [-.267, -.165], [-.074, -.16]],
+  };
+  profile(magazineProfiles[kind], kind === 'basic' ? .061 : .079, m.polymer, [], [0, 0, 0], .005, magazine);
+  const magazineBottom = kind === 'basic' ? -.363 : kind === 'heavy' ? -.268 : -.325;
+  a.box(magazine, [kind === 'basic' ? .072 : .088, .015, kind === 'basic' ? .072 : .089], [0, magazineBottom, kind === 'basic' ? -.113 : -.143], m.rubber, [kind === 'tactical' ? .18 : 0, 0, 0], false, .004);
   if (detailed) for (const side of [-1, 1]) for (const z of [-.078, -.108, -.135]) {
-    a.bone(magazine, [side * .043, -.108, z], [side * .043, -.279, z - .025], .0024, m.bright);
+    a.bone(magazine, [side * (kind === 'basic' ? .033 : .043), -.108, z], [side * (kind === 'basic' ? .033 : .043), magazineBottom + .046, z - (kind === 'tactical' ? .025 : 0)], .0024, m.bright);
   }
 
   // Rounded reflex hood. Its open optical axis matches the gameplay ADS offset.
   box([.082, .022, .107], [0, .126, -.158], m.polymer, undefined, .004);
-  if (detailed) {
+  if (detailed && kind === 'heavy') {
+    // A visibly longer optical tube, open along the same ADS sight axis.
+    a.add(group, new THREE.CylinderGeometry(.061, .059, .194, 18, 1, true), m.polymer, [0, .192, -.155], [Math.PI / 2, 0, 0]);
+    a.add(group, new THREE.CylinderGeometry(.075, .061, .086, 18, 1, true), m.steel, [0, .192, -.293], [Math.PI / 2, 0, 0]);
+    for (const [z, radius] of [[-.058, .06], [-.253, .06], [-.336, .075]]) {
+      a.add(group, new THREE.TorusGeometry(radius, .006, 5, 18), m.rubber, [0, .192, z]);
+    }
+    a.add(group, new THREE.CircleGeometry(.057, 18), m.glass, [0, .192, -.241]);
+    a.add(group, new THREE.CylinderGeometry(.024, .024, .022, 12), m.steel, [.071, .192, -.146], [0, 0, Math.PI / 2]);
+    a.add(group, new THREE.CylinderGeometry(.025, .025, .025, 12), m.polymer, [0, .266, -.146]);
+    for (const z of [-.096, -.219]) box([.089, .02, .021], [0, .14, z], m.steel, undefined, .002);
+    a.add(group, new THREE.SphereGeometry(.0027, 8, 6), m.dot, [0, .192, -.154]);
+  } else if (detailed) {
     const hood = roundedRectangle(.121, .126, .026, 0, .194);
     const opening = roundedRectangle(.085, .087, .017, 0, .194);
     hood.holes.push(new THREE.Path(opening.getPoints(4)));
@@ -227,135 +249,187 @@ function buildCarbine(group, a, detailed = true) {
     box([.11, .017, .027], [0, .246, -.16], m.polymer, undefined, 0);
   }
   group.userData.muzzle = new THREE.Vector3(0, .026, -.94);
-  group.userData.parts = { magazine };
+  group.userData.reticle = new THREE.Vector3(0, .192, -.154);
+  const casingEject = new THREE.Group(); casingEject.name = 'Ejection port'; casingEject.position.set(.097, .028, -.065); group.add(casingEject);
+  group.userData.parts = { magazine, bolt, casingEject };
 }
 
-/** Anatomical guard with articulated shoulders/hips, armor and equipment. */
+/** Human guard with an articulated anatomical rig and independently movable face. */
 export function createSoldier() {
-  const group = new THREE.Group(); group.name = 'Armored patrol guard';
+  const group = new THREE.Group(); group.name = 'Human patrol operator';
   const bodyMeshes = [], headMeshes = [], limbs = {};
   const a = assembler(group, { bodyMeshes, headMeshes });
   const uniform = surface(0xffffff, .96, 0, { map: fabricTexture() });
-  const carrier = surface(0x61634c, .93);
-  const fabric = surface(0x84836b, .97);
-  const dark = surface(0x2a3029, .85);
-  const rubber = surface(0x202622, .91);
-  const skin = surface(0xba9c7d, .78);
-  const lens = surface(0x172e2b, .18, .55);
-  const buckles = surface(0x92927b, .52, .3);
+  const carrier = surface(0x64654f, .93), fabric = surface(0x86816b, .97);
+  const dark = surface(0x30372d, .86), rubber = surface(0x222820, .92);
+  const skin = surface(0xc29c7c, .82), lips = surface(0x916957, .93);
+  const hair = surface(0x463d33, .99), eyeWhite = surface(0xd8dacb, .38);
+  const iris = surface(0x65765c, .35), pupil = surface(0x111914, .24);
+  const buckles = surface(0x92927b, .52, .3), glass = surface(0x1d3736, .18, .6);
+  const torso = new THREE.Group(); torso.name = 'Breathing torso'; torso.position.y = .955; group.add(torso);
+  const head = new THREE.Group(); head.name = 'Head and neck'; head.position.y = .625; torso.add(head);
+  const rig = { torso, head, eyes: [], brows: [], animation: { phase: 0, locomotion: 0, alert: 0, offset: Math.random() * 3.5 } };
 
-  // Tapered, flattened torso and pelvis, with a rounded plate carrier.
-  a.add(group, new THREE.CylinderGeometry(.255, .206, .51, 10), uniform, [0, 1.23, 0], [0, 0, 0], [1, 1, .64]);
-  a.ellipsoid(group, [0, .97, 0], [.233, .144, .165], uniform);
-  a.add(group, sideProfile([[1.43, .15], [1.49, .09], [1.51, -.055], [1.4, -.095], [1.08, -.083], [1.047, .18]], .43, [], .016), carrier);
-  a.box(group, [.455, .394, .101], [0, 1.285, .153], carrier, undefined, false, .024);
-  a.box(group, [.362, .397, .145], [0, 1.275, -.239], carrier, undefined, false, .035);
-  a.box(group, [.29, .127, .15], [0, 1.014, -.232], fabric, undefined, false, .023);
-  for (const x of [-.183, .183]) {
-    a.box(group, [.067, .208, .062], [x, 1.43, .15], fabric, [-.33, 0, x > 0 ? -.10 : .10], false, .011);
-    a.box(group, [.071, .026, .072], [x, 1.4, .193], buckles, undefined, false, 0);
+  // Human shoulders slope into a narrower waist rather than a rectangular body.
+  a.add(torso, new THREE.CylinderGeometry(.226, .177, .49, 12), uniform, [0, 1.228, 0], [0, 0, 0], [1, 1, .64]);
+  a.ellipsoid(torso, [0, .981, -.008], [.207, .127, .151], uniform);
+  a.box(torso, [.397, .371, .088], [0, 1.283, .142], carrier, undefined, false, .028);
+  a.box(torso, [.318, .367, .143], [0, 1.289, -.22], carrier, undefined, false, .032);
+  a.box(torso, [.255, .105, .157], [0, 1.042, -.237], fabric, undefined, false, .02);
+  for (const x of [-.154, .154]) {
+    a.box(torso, [.056, .194, .046], [x, 1.428, .132], fabric, [-.29, 0, x > 0 ? -.1 : .1], false, .01);
+    a.box(torso, [.059, .023, .025], [x, 1.411, .159], buckles, undefined, false, 0);
   }
-  for (const x of [-.14, 0, .14]) {
-    a.box(group, [.116, .175, .088], [x, 1.159, .224], fabric, undefined, false, .016);
-    a.box(group, [.118, .047, .034], [x, 1.234, .271], carrier, undefined, false, .007);
+  for (const x of [-.12, 0, .12]) {
+    a.box(torso, [.102, .163, .075], [x, 1.169, .209], fabric, undefined, false, .015);
+    a.box(torso, [.106, .039, .025], [x, 1.24, .25], carrier, undefined, false, .006);
   }
-  for (const y of [1.31, 1.353]) a.box(group, [.372, .012, .015], [0, y, .211], fabric, undefined, false, 0);
-  a.box(group, [.1, .052, .014], [.055, 1.422, .213], dark, undefined, false, .003);
-  a.box(group, [.452, .063, .344], [0, .973, .003], dark, undefined, false, .011);
-  a.box(group, [.092, .05, .025], [0, .972, .188], buckles, undefined, false, 0);
-  a.box(group, [.101, .175, .094], [.247, 1.25, .029], carrier, undefined, false, .015);
-  a.add(group, new THREE.CylinderGeometry(.005, .006, .227, 6), dark, [.2635, 1.4485, .029]);
-  a.box(group, [.106, .172, .117], [-.242, .96, .017], fabric, undefined, false, .017);
+  for (const y of [1.324, 1.366]) a.box(torso, [.31, .011, .015], [0, y, .19], fabric, undefined, false, 0);
+  a.box(torso, [.085, .04, .012], [.046, 1.414, .185], dark, undefined, false, .002);
+  a.box(torso, [.399, .058, .31], [0, .996, .002], dark, undefined, false, .01);
+  a.box(torso, [.082, .046, .019], [0, .992, .162], buckles, undefined, false, 0);
+  a.box(torso, [.075, .15, .075], [.224, 1.285, -.005], carrier, undefined, false, .011);
+  a.add(torso, new THREE.CylinderGeometry(.004, .005, .20, 6), dark, [.233, 1.463, -.005]);
+  a.box(torso, [.092, .148, .096], [-.21, .981, .006], fabric, undefined, false, .015);
 
-  // Human skull, exposed cheek/ear shapes, balaclava, goggles and shell helmet.
-  a.ellipsoid(group, [0, 1.571, .016], [.078, .11, .075], fabric, true);
-  a.ellipsoid(group, [0, 1.749, .021], [.142, .179, .131], skin, true, 12);
-  a.ellipsoid(group, [0, 1.663, .084], [.126, .07, .088], fabric, true);
-  a.ellipsoid(group, [0, 1.739, .151], [.025, .045, .035], skin, true, 8);
+  // Exposed facial anatomy: a shaped jaw, eyelids, irises, brows, nose and lips.
+  a.add(head, new THREE.CylinderGeometry(.059, .067, .119, 10), skin, [0, 1.585, .008], [0, 0, 0], [1, 1, 1], true);
+  a.ellipsoid(head, [0, 1.76, -.002], [.126, .153, .119], skin, true, 16);
+  a.ellipsoid(head, [0, 1.667, .018], [.094, .067, .088], skin, true, 10);
+  a.ellipsoid(head, [0, 1.732, .115], [.016, .031, .016], skin, true, 12);
+  a.ellipsoid(head, [0, 1.714, .129], [.020, .012, .016], skin, true, 12);
+  const mouth = new THREE.Group(); mouth.name = 'Expression mouth'; mouth.position.set(0, .108, .128); head.add(mouth); rig.mouth = mouth;
+  a.ellipsoid(mouth, [0, .002, -.004], [.036, .003, .005], lips, true, 10);
+  a.ellipsoid(mouth, [0, -.003, -.005], [.034, .0035, .005], lips, true, 10);
+  a.ellipsoid(mouth, [0, 0, .001], [.032, .0012, .0014], hair, true, 8);
   for (const side of [-1, 1]) {
-    a.ellipsoid(group, [side * .143, 1.758, .018], [.029, .048, .029], skin, true, 8);
-    a.ellipsoid(group, [side * .174, 1.787, -.002], [.034, .074, .057], rubber, true, 8);
-    a.box(group, [.023, .046, .064], [side * .193, 1.80, .003], carrier, undefined, true, .01);
+    a.ellipsoid(head, [side * .119, 1.752, -.003], [.026, .043, .024], skin, true, 8);
+    a.ellipsoid(head, [side * .145, 1.783, -.023], [.025, .057, .044], rubber, true, 8);
+    a.box(head, [.018, .043, .04], [side * .161, 1.782, -.02], carrier, undefined, true, .007);
+    const eye = new THREE.Group(); eye.name = side < 0 ? 'Left eye' : 'Right eye'; eye.position.set(side * .046, .182, .108); head.add(eye); rig.eyes.push(eye);
+    a.ellipsoid(eye, [0, 0, 0], [.021, .007, .006], eyeWhite, true, 10);
+    a.ellipsoid(eye, [0, 0, .006], [.0077, .0067, .0022], iris, true, 8);
+    a.ellipsoid(eye, [0, 0, .008], [.0040, .0048, .0015], pupil, true, 8);
+    a.ellipsoid(head, [side * .046, 1.773, .108], [.024, .0035, .006], skin, true, 8);
+    const brow = new THREE.Group(); brow.name = 'Expressive brow'; brow.position.set(side * .052, .204, .109); head.add(brow); rig.brows.push(brow);
+    a.ellipsoid(brow, [0, 0, 0], [.028, .0035, .006], hair, true, 8);
   }
-  const helmet = new THREE.SphereGeometry(.208, 12, 7, 0, TAU, 0, Math.PI * .61);
-  a.add(group, helmet, carrier, [0, 1.842, .002], [0, 0, 0], [1, .73, .99], true);
-  a.add(group, new THREE.TorusGeometry(.195, .014, 4, 16), rubber, [0, 1.817, .002], [Math.PI / 2, 0, 0], [1, 1, 1], true);
-  a.box(group, [.058, .07, .031], [0, 1.908, .19], dark, [-.25, 0, 0], true, .008);
-  a.box(group, [.262, .078, .05], [0, 1.777, .15], dark, undefined, true, .018);
-  a.box(group, [.229, .053, .027], [0, 1.78, .179], lens, undefined, true, .015);
-  a.box(group, [.025, .07, .015], [0, 1.778, .197], dark, undefined, true, .005);
-  a.bone(group, [-.174, 1.753, .033], [-.12, 1.687, .19], .005, dark, true);
-  a.ellipsoid(group, [-.108, 1.687, .202], [.017, .009, .009], rubber, true, 8);
+  // Goggles are raised onto the helmet, so the operator's eyes remain visible.
+  a.add(head, new THREE.SphereGeometry(.179, 14, 7, 0, TAU, 0, Math.PI * .61), carrier, [0, 1.855, -.006], [0, 0, 0], [1, .67, 1], true);
+  a.add(head, new THREE.TorusGeometry(.166, .011, 4, 18), rubber, [0, 1.824, -.006], [Math.PI / 2, 0, 0], [1, 1, 1], true);
+  a.box(head, [.201, .048, .038], [0, 1.886, .14], dark, [-.2, 0, 0], true, .013);
+  for (const side of [-1, 1]) a.box(head, [.08, .031, .015], [side * .046, 1.887, .16], glass, [-.2, 0, 0], true, .009);
+  a.bone(head, [-.145, 1.759, .016], [-.095, 1.699, .145], .004, dark, true);
+  a.ellipsoid(head, [-.084, 1.699, .157], [.014, .007, .007], rubber, true, 8);
 
-  for (const [name, side] of [['leftLeg', -1], ['rightLeg', 1]]) {
-    const pivot = new THREE.Group(); pivot.name = name; pivot.position.set(side * .139, .95, 0); group.add(pivot); limbs[name] = pivot;
-    a.bone(pivot, [0, -.057, 0], [side * .012, -.377, .014], .112, uniform, false, .089);
-    a.bone(pivot, [side * .012, -.448, .015], [side * .012, -.73, -.004], .084, uniform, false, .069);
-    a.ellipsoid(pivot, [side * .012, -.412, .112], [.096, .11, .032], carrier);
-    a.box(pivot, [.177, .042, .186], [side * .012, -.447, .004], dark, undefined, false, .01);
-    a.ellipsoid(pivot, [0, -.829, .043], [.105, .119, .177], rubber);
-    a.box(pivot, [.212, .043, .29], [0, -.927, .053], dark, undefined, false, .016);
-    a.box(pivot, [.136, .106, .076], [0, -.808, .12], fabric, [.31, 0, 0], false, .013);
-    for (let y = -.779; y > -.85; y -= .027) a.box(pivot, [.105, .005, .009], [0, y, .161], dark, undefined, false, 0);
+  for (const [label, sign] of [['left', -1], ['right', 1]]) {
+    const hip = new THREE.Group(); hip.name = `${label} hip`; hip.position.set(sign * .139, .951, 0); group.add(hip); limbs[`${label}Leg`] = hip;
+    const knee = new THREE.Group(); knee.name = `${label} knee`; knee.position.y = -.425; hip.add(knee);
+    const ankle = new THREE.Group(); ankle.name = `${label} ankle`; ankle.position.y = -.415; knee.add(ankle);
+    a.bone(hip, [0, -.041, 0], [0, -.397, 0], .095, uniform, false, .079);
+    a.bone(knee, [0, -.024, 0], [0, -.376, -.004], .073, uniform, false, .056);
+    a.ellipsoid(knee, [0, -.01, .083], [.077, .081, .025], carrier);
+    a.box(knee, [.152, .03, .151], [0, -.043, 0], dark, undefined, false, .007);
+    a.ellipsoid(ankle, [0, -.041, .02], [.09, .072, .138], rubber);
+    a.box(ankle, [.19, .031, .263], [0, -.098, .051], dark, undefined, false, .012);
+    a.ellipsoid(ankle, [0, -.061, .142], [.089, .042, .06], rubber);
+    a.box(ankle, [.121, .067, .053], [0, -.019, .095], fabric, [.28, 0, 0], false, .011);
+    for (const y of [-.005, -.028, -.051]) a.box(ankle, [.092, .004, .007], [0, y, .12], dark, undefined, false, 0);
+
+    const upperArm = new THREE.Group(); upperArm.name = `${label} shoulder`; upperArm.position.set(sign * .275, 1.445, 0); group.add(upperArm); limbs[`${label}Arm`] = upperArm;
+    const elbow = new THREE.Group(); elbow.name = `${label} elbow`; elbow.position.y = -.31; upperArm.add(elbow);
+    const hand = new THREE.Group(); hand.name = `${label} wrist and fingers`; hand.position.y = -.29; elbow.add(hand);
+    a.bone(upperArm, [0, -.025, 0], [0, -.282, 0], .081, uniform, false, .068);
+    a.ellipsoid(upperArm, [0, -.024, -.015], [.091, .085, .071], carrier);
+    a.bone(elbow, [0, -.018, 0], [0, -.268, 0], .065, uniform, false, .043);
+    a.ellipsoid(elbow, [0, -.009, -.053], [.058, .052, .022], carrier);
+    a.ellipsoid(hand, [0, -.006, 0], [.048, .047, .064], dark);
+    for (let i = 0; i < 4; i++) a.ellipsoid(hand, [(i - 1.5) * .019, -.027, .021], [.009, .022, .019], rubber, false, 6);
+    a.ellipsoid(hand, [sign * .044, -.009, .009], [.014, .024, .016], dark, false, 6);
+    rig[label] = { sign, upperArm, elbow, hand, hip, knee, ankle, upperLength: .31, lowerLength: .29, thighLength: .425, shinLength: .415,
+      shoulderAnchor: new THREE.Vector3(sign * .275, .49, 0), grip: new THREE.Vector3(label === 'left' ? -.04 : 0, label === 'left' ? -.062 : -.14, label === 'left' ? -.424 : .07) };
   }
-
-  const handTargets = { leftArm: [-.015, 1.191, .471], rightArm: [.059, 1.121, .164] };
-  for (const [name, side] of [['leftArm', -1], ['rightArm', 1]]) {
-    const pivot = new THREE.Group(); pivot.name = name; pivot.position.set(side * .31, 1.451, 0); group.add(pivot); limbs[name] = pivot;
-    const elbow = name === 'leftArm' ? [.102, -.258, .213] : [-.004, -.267, .073];
-    const target = new THREE.Vector3(...handTargets[name]).sub(pivot.position).toArray();
-    const wrist = new THREE.Vector3(...target).lerp(new THREE.Vector3(...elbow), .12).toArray();
-    a.bone(pivot, [0, -.023, 0], elbow, .099, uniform, false, .08);
-    a.bone(pivot, elbow, wrist, .078, uniform, false, .052);
-    a.ellipsoid(pivot, [0, -.023, -.023], [.115, .114, .086], carrier);
-    a.ellipsoid(pivot, [elbow[0], elbow[1], elbow[2] - .057], [.075, .066, .036], carrier);
-    a.ellipsoid(pivot, target, [.059, .051, .069], dark);
-    for (let i = 0; i < 4; i++) a.ellipsoid(pivot,
-      [target[0] + (i - 1.5) * .022, target[1] - .03, target[2] + .027], [.011, .022, .022], rubber, false, 6);
-  }
-
-  const rifle = new THREE.Group(); rifle.name = 'Guard carbine'; rifle.position.set(.052, 1.216, .245); rifle.rotation.y = Math.PI; rifle.scale.setScalar(.62); group.add(rifle);
+  const rifle = new THREE.Group(); rifle.name = 'Operator held rifle'; rifle.position.set(-.025, .28, .125); rifle.rotation.y = Math.PI; rifle.scale.setScalar(.62); torso.add(rifle); rig.rifle = rifle;
   buildCarbine(rifle, a, false);
   a.flush();
-  return { group, bodyMeshes, headMeshes, limbs };
+  // Body/head parts were authored in familiar ground coordinates; joints own
+  // local geometry from this point onward, so gaze and breathing need no skins.
+  for (const child of torso.children) if (child.isMesh) child.geometry.translate(0, -.955, 0);
+  for (const child of head.children) if (child.isMesh) child.geometry.translate(0, -1.58, 0);
+  const soldier = { group, bodyMeshes, headMeshes, limbs, rig };
+  animateSoldier(soldier, 0, { time: 0 });
+  return soldier;
 }
 
-/** Player carbine with real openings, sculpted metal/polymer and gloved hands. */
-export function createWeapon() {
-  const group = new THREE.Group(); group.name = 'AR-36 tactical carbine';
+function deformWeaponFront(mesh, factor) {
+  if (!mesh.isMesh || factor === 1) return;
+  const positions = mesh.geometry.attributes.position, normals = mesh.geometry.attributes.normal;
+  for (let i = 0; i < positions.count; i++) if (positions.getZ(i) < -.264) {
+    positions.setZ(i, -.264 + (positions.getZ(i) + .264) * factor);
+    if (normals) {
+      const x = normals.getX(i), y = normals.getY(i), z = normals.getZ(i) / factor;
+      const length = Math.hypot(x, y, z) || 1; normals.setXYZ(i, x / length, y / length, z / length);
+    }
+  }
+  positions.needsUpdate = true; if (normals) normals.needsUpdate = true;
+  mesh.geometry.computeBoundingBox(); mesh.geometry.computeBoundingSphere();
+}
+
+/** Three distinct firearm silhouettes, with shared ADS and animation contracts. */
+export function createWeapon(kind = 'basic') {
+  if (!['basic', 'tactical', 'heavy'].includes(kind)) kind = 'basic';
+  const group = new THREE.Group();
+  group.name = { basic: 'SR-32 compact carbine', tactical: 'AR-36 assault rifle', heavy: 'BR-46 precision rifle' }[kind];
+  group.userData.kind = kind;
   const a = assembler(group);
-  buildCarbine(group, a, true);
+  buildCarbine(group, a, true, kind);
+  a.flush();
+  const factor = { basic: .62, tactical: 1, heavy: 1.32 }[kind];
+  group.children.filter(child => child.isMesh).forEach(mesh => deformWeaponFront(mesh, factor));
+  group.userData.muzzle.z = -.264 + (group.userData.muzzle.z + .264) * factor;
   const sleeve = surface(0xffffff, .97, 0, { map: fabricTexture(false) });
-  const glove = surface(0x555749, .96);
-  const padding = surface(0x303931, .84);
-  const seams = surface(0x8c876e, .95);
-  // Forearm tapers follow the elbow-to-wrist direction, rather than box arms.
-  a.bone(group, [.154, -.279, .44], [.037, -.164, .112], .074, sleeve, false, .047);
-  a.bone(group, [-.338, -.246, .207], [-.091, -.091, -.368], .068, sleeve, false, .049);
-  a.ellipsoid(group, [.027, -.136, .091], [.057, .074, .065], glove, false, 12);
-  a.ellipsoid(group, [-.035, -.062, -.424], [.066, .047, .09], glove, false, 12);
-  a.ellipsoid(group, [.069, -.138, .098], [.021, .043, .03], padding);
-  a.ellipsoid(group, [-.053, -.09, -.412], [.062, .017, .052], padding);
-  a.box(group, [.103, .017, .032], [.035, -.179, .133], padding, [-.26, 0, .26], false, .009);
-  a.box(group, [.104, .016, .026], [-.093, -.096, -.348], padding, [0, -.36, -.19], false, .008);
-  // Individually rounded curled fingers wrap the grip and handguard.
+  const glove = surface(0x555749, .96), padding = surface(0x303931, .84), seams = surface(0x8c876e, .95);
+  const leftHand = new THREE.Group(), rightHand = new THREE.Group();
+  leftHand.name = 'Support hand and forearm'; rightHand.name = 'Trigger hand and forearm'; group.add(leftHand, rightHand);
+  group.userData.parts.leftHand = leftHand; group.userData.parts.rightHand = rightHand;
+  a.bone(rightHand, [.154, -.279, .44], [.037, -.164, .112], .074, sleeve, false, .047);
+  a.bone(leftHand, [-.338, -.246, .207], [-.091, -.091, -.368], .068, sleeve, false, .049);
+  a.ellipsoid(rightHand, [.027, -.136, .091], [.057, .074, .065], glove, false, 12);
+  a.ellipsoid(leftHand, [-.035, -.062, -.424], [.066, .047, .09], glove, false, 12);
+  a.ellipsoid(rightHand, [.069, -.138, .098], [.021, .043, .03], padding);
+  a.ellipsoid(leftHand, [-.053, -.09, -.412], [.062, .017, .052], padding);
+  a.box(rightHand, [.103, .017, .032], [.035, -.179, .133], padding, [-.26, 0, .26], false, .009);
+  a.box(leftHand, [.104, .016, .026], [-.093, -.096, -.348], padding, [0, -.36, -.19], false, .008);
   for (let i = 0; i < 3; i++) {
     const y = -.112 - i * .025;
-    a.bone(group, [.048, y, .065], [.027, y - .006, .032], .0117, glove);
-    a.bone(group, [.027, y - .006, .032], [-.006, y - .004, .047], .0117, glove);
-    a.ellipsoid(group, [.045, y + .002, .068], [.016, .01, .019], padding);
+    a.bone(rightHand, [.048, y, .065], [.027, y - .006, .032], .0117, glove);
+    a.bone(rightHand, [.027, y - .006, .032], [-.006, y - .004, .047], .0117, glove);
+    a.ellipsoid(rightHand, [.045, y + .002, .068], [.016, .01, .019], padding);
   }
-  a.bone(group, [.046, -.079, .069], [.049, -.082, -.009], .0114, glove);
-  a.bone(group, [.049, -.082, -.009], [.017, -.094, -.018], .011, glove);
-  a.bone(group, [-.027, -.104, .087], [-.025, -.099, .058], .016, glove);
+  a.bone(rightHand, [.046, -.079, .069], [.049, -.082, -.009], .0114, glove);
+  a.bone(rightHand, [.049, -.082, -.009], [.017, -.094, -.018], .011, glove);
+  a.bone(rightHand, [-.027, -.104, .087], [-.025, -.099, .058], .016, glove);
   for (let i = 0; i < 4; i++) {
     const z = -.387 - i * .026;
-    a.bone(group, [-.073, -.042, z], [-.056, -.013, z], .0115, glove);
-    a.bone(group, [-.056, -.013, z], [-.03, -.009, z], .0108, glove);
-    a.ellipsoid(group, [-.067, -.033, z], [.014, .012, .013], padding);
+    a.bone(leftHand, [-.073, -.042, z], [-.056, -.013, z], .0115, glove);
+    a.bone(leftHand, [-.056, -.013, z], [-.03, -.009, z], .0108, glove);
+    a.ellipsoid(leftHand, [-.067, -.033, z], [.014, .012, .013], padding);
   }
-  a.bone(group, [.006, -.067, -.363], [.033, -.039, -.392], .017, glove);
-  a.bone(group, [-.327, -.237, .191], [-.111, -.08, -.347], .0028, seams);
+  a.bone(leftHand, [.006, -.067, -.363], [.033, -.039, -.392], .017, glove);
+  a.bone(leftHand, [-.327, -.237, .191], [-.111, -.08, -.347], .0028, seams);
   a.flush();
+  // Pivot at the wrists; the forearms stay attached when the support hand
+  // reaches for a magazine, while the sight and receiver remain stationary.
+  leftHand.position.set(-.035, -.062, -.264 + (-.424 + .264) * factor);
+  rightHand.position.set(.027, -.136, .091);
+  for (const mesh of leftHand.children) if (mesh.isMesh) {
+    deformWeaponFront(mesh, factor); mesh.geometry.translate(-leftHand.position.x, -leftHand.position.y, -leftHand.position.z);
+  }
+  for (const mesh of rightHand.children) if (mesh.isMesh) mesh.geometry.translate(-rightHand.position.x, -rightHand.position.y, -rightHand.position.z);
+  for (const part of Object.values(group.userData.parts)) {
+    part.userData.restPosition = part.position.clone();
+    part.userData.restRotation = part.rotation.clone();
+    part.userData.restQuaternion = part.quaternion.clone();
+  }
   return group;
 }
