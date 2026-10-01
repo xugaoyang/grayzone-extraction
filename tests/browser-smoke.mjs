@@ -62,7 +62,10 @@ try{
       const g=window.__game,e=g.enemyTarget(0);const spots=[{x:e.x,z:e.z+3},{x:e.x,z:e.z-3},{x:e.x+3,z:e.z},{x:e.x-3,z:e.z}];
       const p=spots.find(p=>!g.blocked(p.x,p.z));g.teleport(p.x,p.z);g.look(Math.atan2(-(e.x-p.x),-(e.z-p.z)),Math.atan2(e.y-1.68,Math.hypot(e.x-p.x,e.z-p.z)));g.safe();
     });
-    await page.waitForTimeout(280);await page.mouse.click(800,500);await page.waitForTimeout(230);
+    await page.waitForTimeout(280);
+    // Reacquire a moving guard just before the real mouse click.
+    await page.evaluate(()=>{const g=window.__game,e=g.enemyTarget(0),p=g.snapshot().player;g.look(Math.atan2(-(e.x-p.x),-(e.z-p.z)),Math.atan2(e.y-1.68,Math.hypot(e.x-p.x,e.z-p.z)));});
+    await page.mouse.click(800,500);await page.waitForTimeout(230);
   }
   s=await snapshot();check('real raycast gunfire defeats a guard',s.player.kills>=1);
   const expectedLoot=s.player.loot.reduce((n,i)=>n+i.value,0),creditsBefore=s.profile.credits,kills=s.player.kills;

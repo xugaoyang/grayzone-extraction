@@ -11,7 +11,8 @@
     "start": "node server.mjs",
     "test": "node --test tests/*.test.js",
     "test:browser": "node tests/browser-smoke.mjs",
-    "test:combat": "node tests/browser-combat.mjs"
+    "test:combat": "node tests/browser-combat.mjs",
+    "test:mobile": "node tests/browser-mobile.mjs"
   },
   "dependencies": { "three": "^0.180.0" },
   "devDependencies": { "vite": "^7.1.7", "@playwright/test": "^1.55.1" }

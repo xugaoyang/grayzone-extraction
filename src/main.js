@@ -7,6 +7,7 @@ import { GameAudio } from './audio.js';
 import { getWeapon, damageAtDistance, needsTriggerRelease, nextFireMode } from './weapons.js';
 import { animateSoldier } from './actor-animation.js';
 import { CombatEffects } from './combat-effects.js';
+import { TouchControls } from './touch-controls.js';
 
 const $ = id => document.getElementById(id);
 const money = n => Math.round(n).toLocaleString('zh-CN');
@@ -14,11 +15,12 @@ const clamp = THREE.MathUtils.clamp;
 const distance = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
 const screens = ['lobby', 'hud', 'inventory', 'pause', 'result', 'help', 'settings', 'map-overlay'];
 const audio = new GameAudio();
+const prefersTouch = matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints > 0 && matchMedia('(hover: none)').matches);
 let profile = loadProfile(), selectedKit = 'basic', state = 'lobby', overlayReturn = 'lobby';
-let settings = { sensitivity: 1, volume: .5, musicVolume: .4, quality: 'high' };
+let settings = { sensitivity: 1, volume: .5, musicVolume: .4, quality: prefersTouch ? 'low' : 'high' };
 try {
   const stored = JSON.parse(localStorage.getItem('grayzone.settings') || '{}');
-  settings = { sensitivity: clamp(Number(stored.sensitivity) || 1, .3, 2), volume: Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : .5, musicVolume: Number.isFinite(stored.musicVolume) ? clamp(stored.musicVolume, 0, 1) : .4, quality: ['low','medium','high'].includes(stored.quality) ? stored.quality : 'high' };
+  settings = { sensitivity: clamp(Number(stored.sensitivity) || 1, .3, 2), volume: Number.isFinite(stored.volume) ? clamp(stored.volume, 0, 1) : .5, musicVolume: Number.isFinite(stored.musicVolume) ? clamp(stored.musicVolume, 0, 1) : .4, quality: ['low','medium','high'].includes(stored.quality) ? stored.quality : prefersTouch ? 'low' : 'high' };
 } catch { /* Keep safe defaults. */ }
 audio.volume = settings.volume;
 audio.musicVolume = settings.musicVolume;
@@ -29,9 +31,9 @@ camera.rotation.order = 'YXZ';
 scene.add(camera);
 let renderer;
 try {
-  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer = new THREE.WebGLRenderer({ antialias: !prefersTouch, powerPreference: 'high-performance' });
 } catch {
-  document.body.innerHTML = '<main style="padding:60px;color:#e0e8e0;background:#111b1c;font-family:sans-serif"><h1>需要支持 WebGL 的浏览器</h1><p>请使用新版 Chrome 或 Edge，并在浏览器设置中开启硬件加速，再重新打开游戏。</p></main>';
+  document.body.innerHTML = '<main style="padding:32px;color:#e0e8e0;background:#111b1c;font-family:sans-serif"><h1>需要支持 WebGL 的浏览器</h1><p>请使用新版 Safari、Chrome 或 Edge 打开游戏。</p></main>';
   throw new Error('WebGL unavailable');
 }
 renderer.setSize(innerWidth, innerHeight);
@@ -57,6 +59,8 @@ weapon.add(muzzleFlash);
 const ray = new THREE.Raycaster();
 const up = new THREE.Vector3(0,1,0);
 const keys = new Set();
+let touchControls = null;
+const touchToggles = { sprint: false, crouch: false };
 let mouseDown = false, aiming = false, yaw = 0, pitch = 0, recoil = 0;
 let shotKick=0, shotAge=10;
 let gaitPhase=0,motionEnvelope=0,viewRoll=0;
@@ -81,7 +85,8 @@ function setScreen(next) {
   document.body.dataset.state = next;
   const fieldOverlay = ['inventory','pause','map-overlay'].includes(next) || (['help','settings'].includes(next) && player && overlayReturn !== 'lobby');
   audio.setMood(next === 'hud' ? 'raid' : next === 'result' ? 'result' : fieldOverlay ? 'pause' : 'lobby');
-  mouseDown = false; aiming = false; keys.clear();
+  resetInput();
+  if (touchControls) { touchControls.setActive(next === 'hud'); $('touch-controls').hidden = next !== 'hud' || !touchControls.enabled; }
   if (next !== 'hud') { muzzle.intensity = 0; muzzleFlash.visible = false; }
   if (next !== 'hud' && document.pointerLockElement) document.exitPointerLock();
 }
@@ -93,7 +98,7 @@ function toast(message, type = '') {
   setTimeout(() => node.remove(), 4200);
 }
 async function lockPointer() {
-  if (state !== 'hud' || document.pointerLockElement === renderer.domElement) return;
+  if (state !== 'hud' || touchControls?.enabled || document.pointerLockElement === renderer.domElement) return;
   try { await renderer.domElement.requestPointerLock(); }
   catch { toast('点击画面进入鼠标控制；浏览器拒绝时请稍后重试。'); }
 }
@@ -173,7 +178,7 @@ function deploy() {
   weaponSway.set(0,0);mapRoute = null;shotKick=0;shotAge=10;gaitPhase=0;motionEnvelope=0;viewRoll=0;
   camera.position.set(player.x,1.68,player.z); camera.rotation.set(0,0,0);
   weapon.visible = true; setScreen('hud'); updateHUD(); audio.unlock(); lockPointer();
-  toast('行动开始：先搜索前方物资箱。长按 E 搜索，M 查看撤离路线。');
+  toast(touchControls?.enabled ? '行动开始：左侧摇杆移动，滑动画面瞄准，长按搜索按钮获取物资。' : '行动开始：先搜索前方物资箱。长按 E 搜索，M 查看撤离路线。');
 }
 
 function currentWeight() { return player.loot.reduce((sum,item) => sum + item.weight, 0); }
@@ -224,7 +229,7 @@ function searchCrate(crate) {
   crate.beacon.visible = !crate.empty;
   crate.lid.rotation.x = -.7; crate.lid.position.z = -.25;
   if (count) { audio.play('loot'); toast(`已收入 ${count} 件物资 · 背包估值 ₵ ${money(lootValue())}`); }
-  if (!crate.empty) toast(`容量不足，箱内剩余 ${crate.items.length} 件。Tab 可整理背包。`, 'warn');
+  if (!crate.empty) toast(`容量不足，箱内剩余 ${crate.items.length} 件。${touchControls?.enabled ? '点背包按钮' : 'Tab'}可整理背包。`, 'warn');
   if (player.loot.length >= profile.contract.target) $('mission-text').classList.add('complete');
 }
 function updateAction(dt) {
@@ -373,11 +378,12 @@ function updateEnemies(dt) {
 }
 
 function updatePlayer(dt) {
-  const forward = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown'));
-  const side = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft'));
-  player.moving = forward !== 0 || side !== 0;
-  player.crouching = keys.has('KeyC');
-  player.sprinting = player.moving && forward > 0 && keys.has('ShiftLeft') && player.stamina > 1 && !aiming && !player.crouching && (!action || action.kind === 'heal');
+  const stick = touchControls?.movement || { x: 0, y: 0 };
+  const forward = clamp(Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown')) - stick.y, -1, 1);
+  const side = clamp(Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft')) + stick.x, -1, 1);
+  player.moving = Math.hypot(forward,side) > .02;
+  player.crouching = keys.has('KeyC') || touchToggles.crouch;
+  player.sprinting = player.moving && forward > .1 && (keys.has('ShiftLeft') || touchToggles.sprint) && player.stamina > 1 && !aiming && !player.crouching && (!action || action.kind === 'heal');
   player.stamina = clamp(player.stamina + (player.sprinting ? -23 : 16)*dt,0,100);
   const speed = player.sprinting ? 7 : player.crouching ? 2 : aiming ? 2.5 : 4.2;
   const normal = Math.max(1,Math.hypot(forward,side));
@@ -412,7 +418,7 @@ function updatePlayer(dt) {
   footstep -= dt;
   if(player.moving&&footstep<=0){footstep=player.sprinting?.28:player.crouching?.58:.44;audio.foley(player.sprinting?'sprint':'walk',player.crouching?.45:1);}
   nextShot = Math.max(0,nextShot-dt);
-  if (mouseDown && document.pointerLockElement === renderer.domElement) shoot();
+  if (mouseDown && (touchControls?.enabled || document.pointerLockElement === renderer.domElement)) shoot();
 }
 
 function drawMap(canvas, large = false) {
@@ -487,6 +493,11 @@ function updateHUD() {
   $('ammo-current').classList.toggle('urgent',player.ammo<6);
   $('weapon-name').textContent=weaponConfig.name;
   $('fire-mode').textContent=fireMode==='semi'?'单发':'自动';$('fire-mode-hint').hidden=weaponConfig.fireModes.length<2;
+  $('touch-mode-button').hidden=weaponConfig.fireModes.length<2;
+  ($('touch-mode-button').querySelector('.touch-button-label')||$('touch-mode-button')).textContent=fireMode==='semi'?'单发':'自动';
+  $('touch-interact-button').querySelector('.touch-button-label').textContent=nearest?.kind==='extract'?'撤离':'搜索';
+  $('touch-interact-button').classList.toggle('available',!!nearest);
+  $('touch-interact-button').setAttribute('aria-label',nearest?.kind==='extract'?'长按撤离':'长按搜索');
   $('medkit-count').textContent=player.medkits;
   $('bag-summary').textContent=`${currentWeight()} / ${player.kit.capacity} KG · ₵ ${money(lootValue())}`;
   $('kill-count').textContent=player.kills;
@@ -500,7 +511,7 @@ function updateHUD() {
   const extractionDistance=Math.round(distance(player,world.extract));
   $('extract-label').textContent=`↗ 北岸撤离区　${extractionDistance} m`;
   $('interact-prompt').hidden=!nearest||!!action;
-  if(nearest)$('interact-prompt').innerHTML=`<kbd>长按 E</kbd> ${nearest.kind==='extract'?'呼叫撤离 · 坚守 6 秒':`搜索 ${nearest.label}`}<small>${nearest.kind==='extract'?'松开按键、移动或受到攻击会中断':'获得物资与弹药补给'}</small>`;
+  if(nearest)$('interact-prompt').innerHTML=`<kbd>${touchControls?.enabled?`按住${nearest.kind==='extract'?'撤离':'搜索'}按钮`:'长按 E'}</kbd> ${nearest.kind==='extract'?'呼叫撤离 · 坚守 6 秒':`搜索 ${nearest.label}`}<small>${nearest.kind==='extract'?'松开、移动或受到攻击会中断':'获得物资与弹药补给'}</small>`;
   $('action-progress').hidden=!action;
   if(action){$('action-fill').style.width=`${clamp(action.elapsed/action.duration*100,0,100)}%`;$('action-label').textContent=`${({reload:'正在换弹',heal:'正在治疗',search:'正在搜索',extract:'正在撤离'})[action.kind]}　${Math.max(0,action.duration-action.elapsed).toFixed(1)} s`;}
   $('crosshair').classList.toggle('aiming',aiming);$('crosshair').classList.toggle('sprinting',player.sprinting);
@@ -511,7 +522,7 @@ function updateHUD() {
 
 function renderInventory() {
   $('inventory-weight').textContent=`${currentWeight()} / ${player.kit.capacity} KG · 撤离估值 ₵ ${money(lootValue())}`;
-  $('inventory-items').innerHTML=player.loot.length?player.loot.map((item,i)=>`<div class="loot-row rarity-${item.rarity}"><span class="loot-icon">◇</span><span><strong>${item.name}</strong><small>${item.weight} KG</small></span><b>₵ ${money(item.value)}</b><button class="drop-item" data-drop="${i}" aria-label="丢弃${item.name}">丢弃</button></div>`).join(''):'<p class="empty-state">背包为空。靠近发光的物资箱，长按 E 搜索。</p>';
+  $('inventory-items').innerHTML=player.loot.length?player.loot.map((item,i)=>`<div class="loot-row rarity-${item.rarity}"><span class="loot-icon">◇</span><span><strong>${item.name}</strong><small>${item.weight} KG</small></span><b>₵ ${money(item.value)}</b><button class="drop-item" data-drop="${i}" aria-label="丢弃${item.name}">丢弃</button></div>`).join(''):`<p class="empty-state">背包为空。靠近发光的物资箱，${touchControls?.enabled?'按住搜索按钮':'长按 E'}搜索。</p>`;
   $('inventory-items').querySelectorAll('[data-drop]').forEach(button=>button.onclick=()=>{
     const [item]=player.loot.splice(Number(button.dataset.drop),1);
     if(item){const ground=crates.find(c=>c.label==='丢弃的物资'&&distance(c,player)<1.5);if(ground){ground.items.push(item);ground.empty=false;ground.beacon.visible=true;}else{const crate=addCrate({x:player.x,z:player.z,tier:1,label:'丢弃的物资'},[item]);crate.searched=true;}audio.play('reload');renderInventory();updateHUD();}
@@ -541,6 +552,66 @@ function openOverlay(id) {
   if(id==='map-overlay')drawMap($('large-map'),true);
 }
 function closeOverlay() { if(overlayReturn==='hud')resume();else setScreen(overlayReturn); }
+function resetInput() {
+  keys.clear(); mouseDown=false; aiming=false;
+  touchToggles.sprint=false; touchToggles.crouch=false;
+  touchControls?.reset();
+}
+function switchFireMode() {
+  if(state!=='hud'||weaponConfig.fireModes.length<2||action)return;
+  fireMode=nextFireMode(weaponConfig,fireMode);mouseDown=false;
+  touchControls?.setPressed('fire',false);
+  audio.reload(weaponConfig.id,'bolt');
+  toast(`射击模式：${fireMode==='semi'?'单发点射':'全自动'}${touchControls?.enabled?'':' · B 切换'}`);
+  updateHUD();
+}
+function moveView(dx,dy,touch=false) {
+  const sensitivity=(touch?.0032:.0021)*settings.sensitivity*(aiming?.62:1);
+  yaw-=dx*sensitivity;pitch=clamp(pitch-dy*sensitivity,-1.45,1.45);
+  weaponSway.x=clamp(weaponSway.x-dx*.00018,-.025,.025);
+  weaponSway.y=clamp(weaponSway.y-dy*.00014,-.018,.018);
+}
+function pressTouch(actionName) {
+  if(state!=='hud')return;
+  audio.unlock();
+  if(actionName==='fire'){
+    touchToggles.sprint=false;touchControls.setPressed('sprint',false);player.sprinting=false;
+    mouseDown=true;if(action?.kind==='heal')action=null;shoot(true);
+  }
+  if(actionName==='interact')keys.add('KeyE');
+  if(actionName==='aim'){
+    aiming=!aiming;touchControls.setPressed('aim',aiming);
+    if(aiming){touchToggles.sprint=false;touchControls.setPressed('sprint',false);player.sprinting=false;}
+  }
+  if(actionName==='sprint'){
+    touchToggles.sprint=!touchToggles.sprint;touchControls.setPressed('sprint',touchToggles.sprint);
+    if(touchToggles.sprint){aiming=false;touchToggles.crouch=false;touchControls.setPressed('aim',false);touchControls.setPressed('crouch',false);}
+  }
+  if(actionName==='crouch'){
+    touchToggles.crouch=!touchToggles.crouch;touchControls.setPressed('crouch',touchToggles.crouch);
+    if(touchToggles.crouch){touchToggles.sprint=false;touchControls.setPressed('sprint',false);}
+  }
+  if(actionName==='reload')startReload();
+  if(actionName==='heal')startHeal();
+  if(actionName==='mode')switchFireMode();
+  if(actionName==='inventory')openOverlay('inventory');
+  if(actionName==='map')openOverlay('map-overlay');
+  if(actionName==='pause')pause();
+  if(actionName==='fullscreen')toggleFullscreen();
+}
+function releaseTouch(actionName) {
+  if(actionName==='fire')mouseDown=false;
+  if(actionName==='interact')keys.delete('KeyE');
+}
+function resizeViewport() {
+  const width=$('viewport').clientWidth||innerWidth,height=$('viewport').clientHeight||innerHeight;
+  camera.aspect=width/height;camera.updateProjectionMatrix();renderer.setSize(width,height);
+}
+async function toggleFullscreen() {
+  audio.unlock();
+  try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}
+  catch{toast('可以直接在浏览器中游玩，横屏视野更宽。');}
+}
 function applySettings() {
   audio.volume=settings.volume;
   audio.musicVolume=settings.musicVolume;
@@ -572,31 +643,46 @@ window.addEventListener('keydown',event=>{
   keys.add(event.code);
   if(event.code==='KeyR')startReload();
   if(event.code==='KeyF')startHeal();
-  if(event.code==='KeyB'&&weaponConfig.fireModes.length>1&&!action){fireMode=nextFireMode(weaponConfig,fireMode);mouseDown=false;audio.reload(weaponConfig.id,'bolt');toast(`射击模式：${fireMode==='semi'?'单发点射':'全自动'} · B 切换`);}
+  if(event.code==='KeyB')switchFireMode();
   if(event.code==='Tab')openOverlay('inventory');
   if(event.code==='KeyM')openOverlay('map-overlay');
 });
 window.addEventListener('keyup',event=>keys.delete(event.code));
 window.addEventListener('mousemove',event=>{
   if(state!=='hud'||document.pointerLockElement!==renderer.domElement)return;
-  yaw-=event.movementX*.0021*settings.sensitivity*(aiming?.62:1);
-  pitch=clamp(pitch-event.movementY*.0021*settings.sensitivity*(aiming?.62:1),-1.45,1.45);
-  weaponSway.x=clamp(weaponSway.x-event.movementX*.00018,-.025,.025);
-  weaponSway.y=clamp(weaponSway.y-event.movementY*.00014,-.018,.018);
+  moveView(event.movementX,event.movementY);
 });
 renderer.domElement.addEventListener('mousedown',event=>{
-  if(state!=='hud')return;
+  if(state!=='hud'||touchControls?.enabled||event.sourceCapabilities?.firesTouchEvents)return;
   audio.unlock();
   if(document.pointerLockElement!==renderer.domElement){lockPointer();return;}
   if(event.button===0){mouseDown=true;if(action?.kind==='heal')action=null;shoot(true);}
   if(event.button===2)aiming=true;
 });
-window.addEventListener('mouseup',event=>{if(event.button===0)mouseDown=false;if(event.button===2)aiming=false;});
+window.addEventListener('mouseup',event=>{if(touchControls?.enabled||event.sourceCapabilities?.firesTouchEvents)return;if(event.button===0)mouseDown=false;if(event.button===2)aiming=false;});
 window.addEventListener('contextmenu',event=>event.preventDefault());
-document.addEventListener('pointerlockchange',()=>{if(!document.pointerLockElement&&state==='hud')pause();});
-window.addEventListener('blur',()=>{keys.clear();mouseDown=false;aiming=false;pause();});
+document.addEventListener('pointerlockchange',()=>{if(!document.pointerLockElement&&!touchControls?.enabled&&state==='hud')pause();});
+window.addEventListener('blur',()=>{resetInput();pause();});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)pause();});
-window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+window.addEventListener('resize',()=>{if(touchControls?.enabled)resetInput();resizeViewport();});
+window.visualViewport?.addEventListener('resize',resizeViewport);
+window.addEventListener('orientationchange',resetInput);
+
+touchControls=new TouchControls({
+  root:$('touch-controls'),joystick:$('touch-joystick'),knob:$('touch-knob'),look:$('touch-look'),
+  onLook:(dx,dy)=>{if(state==='hud')moveView(dx,dy,true);},onPress:pressTouch,onRelease:releaseTouch,
+  onMode:enabled=>{
+    document.body.classList.toggle('touch-mode',enabled);
+    $('touch-controls').hidden=!enabled||state!=='hud';touchControls.setActive(state==='hud');
+    if(enabled&&document.pointerLockElement)document.exitPointerLock();
+  },
+});
+document.body.classList.toggle('touch-mode',touchControls.enabled);
+$('touch-fullscreen').hidden=typeof document.documentElement.requestFullscreen!=='function';
+$('touch-fullscreen').dataset.touchAction='fullscreen';
+$('touch-fullscreen').onclick=toggleFullscreen;
+renderer.domElement.addEventListener('webglcontextlost',()=>{pause();toast('画面暂时中断，恢复后可继续行动。');});
+renderer.domElement.addEventListener('webglcontextrestored',()=>toast('画面已恢复，点击继续行动。'));
 
 function animate(now) {
   requestAnimationFrame(animate);
@@ -608,7 +694,7 @@ function animate(now) {
     hitTime=Math.max(0,hitTime-dt);hurtTime=Math.max(0,hurtTime-dt);muzzle.intensity=Math.max(0,muzzle.intensity-dt*38);
     muzzleFlash.visible=muzzle.intensity>1;
     if(raidTime<=0)finishRaid(false,'行动窗口已关闭，未在时限内撤离');
-    if(elapsed>35&&hintAt===0){hintAt=1;toast('按 M 查看地图。金色物资箱价值更高，绿色圆圈是撤离点。');}
+    if(elapsed>35&&hintAt===0){hintAt=1;toast(`${touchControls?.enabled?'点地图按钮':'按 M'}查看地图。金色物资箱价值更高，绿色圆圈是撤离点。`);}
     if(raidTime<60&&hintAt<2){hintAt=2;toast('剩余时间不足 1 分钟，立即前往北岸撤离区！','warn');}
     uiTime+=dt;if(uiTime>.07){uiTime=0;updateHUD();}
   }else if(state==='lobby'||(state==='help'&&overlayReturn==='lobby')||(state==='settings'&&overlayReturn==='lobby')){
@@ -621,12 +707,12 @@ function animate(now) {
   if(state==='hud'||state==='lobby')combatEffects.update(dt);
   renderer.render(scene,camera);
 }
-applySettings();renderLobby();setScreen('lobby');requestAnimationFrame(animate);
+applySettings();resizeViewport();renderLobby();setScreen('lobby');requestAnimationFrame(animate);
 
 // Explicit development-only integration seam, eliminated from production builds.
 if(import.meta.env.DEV&&new URLSearchParams(location.search).has('test')){
   window.__game={
-    snapshot:()=>({state,profile:structuredClone(profile),settings:{...settings},audio:audio.getDiagnostics(),weapon:{id:weaponConfig.id,fireMode,fov:camera.fov,recoil,kick:shotKick,position:weapon.position.toArray(),muzzle:weapon.userData.muzzle.toArray(),particles:combatEffects.particles.length},player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,actionProgress:action?{elapsed:action.elapsed,duration:action.duration}:null,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health,yaw:e.group.rotation.y,roll:e.group.rotation.z,alert:e.alert,behavior:e.behavior,deathTime:e.deathTime,speed:e.speed,pose:e.rig?{head:e.rig.head.rotation.toArray().slice(0,3),knee:e.rig.left.knee.rotation.x,elbow:e.rig.left.elbow.rotation.x,torso:e.rig.torso.position.toArray()}:null})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
+    snapshot:()=>({state,profile:structuredClone(profile),settings:{...settings},audio:audio.getDiagnostics(),input:{touch:touchControls?.enabled??false,movement:touchControls?.movement??{x:0,y:0},aiming,firing:mouseDown,crouching:touchToggles.crouch||keys.has('KeyC'),sprinting:touchToggles.sprint||keys.has('ShiftLeft'),yaw,pitch},weapon:{id:weaponConfig.id,fireMode,fov:camera.fov,recoil,kick:shotKick,position:weapon.position.toArray(),muzzle:weapon.userData.muzzle.toArray(),particles:combatEffects.particles.length},player:player?{...player,loot:structuredClone(player.loot)}:null,raidTime,elapsed,action:action?.kind,actionProgress:action?{elapsed:action.elapsed,duration:action.duration}:null,reason:finishReason,enemies:enemies.map(e=>({x:e.x,z:e.z,alive:e.alive,health:e.health,yaw:e.group.rotation.y,roll:e.group.rotation.z,alert:e.alert,behavior:e.behavior,deathTime:e.deathTime,speed:e.speed,pose:e.rig?{head:e.rig.head.rotation.toArray().slice(0,3),knee:e.rig.left.knee.rotation.x,elbow:e.rig.left.elbow.rotation.x,torso:e.rig.torso.position.toArray()}:null})),crates:crates.map(c=>({x:c.x,z:c.z,tier:c.tier,empty:c.empty})),extract:world.extract,spawn:world.spawn,solids:world.solids,locked:!!document.pointerLockElement,renderer:renderer.info.render}),
     teleport:(x,z)=>{if(player){player.x=x;player.z=z;camera.position.set(x,1.68,z);}},
     look:(y,p=0)=>{yaw=y;pitch=p;camera.rotation.set(p,y,0);camera.updateMatrixWorld(true);},
     damage:hurt,
